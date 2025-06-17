@@ -109,11 +109,11 @@ func (r Resolver) Resolve(ctx context.Context, nodeClass *v1alpha2.AKSNodeClass,
 		diskType = "Ephemeral"
 	}
 	sku, err := r.instanceTypeProvider.Get(ctx, nodeClass, instanceType.Name)
-	diskSize, placement := instancetype.MaxEphemeralOSDiskSizeGB(sku)
-	//diskType, placement, err := r.getStorageProfile(ctx, instanceType, nodeClass)
 	if err != nil {
 		return nil, err
 	}
+	diskSize, placement := instancetype.GetEphemeralOSDiskSizeAndPlacement(sku)
+
 	template := &template.Parameters{
 		StaticParameters: staticParameters,
 		ScriptlessCustomData: imageFamily.ScriptlessCustomData(

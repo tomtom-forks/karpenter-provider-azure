@@ -355,55 +355,60 @@ func (p *DefaultProvider) isConfidential(sku *skewer.SKU) bool {
 	return strings.HasPrefix(size, "DC") || strings.HasPrefix(size, "EC")
 }
 
-// MaxEphemeralOSDiskSizeGB returns the maximum ephemeral OS disk size for a given SKU.
+// GetEphemeralOSDiskSizeAndPlacement returns the maximum ephemeral OS disk size for a given SKU.
 // Ephemeral OS disk size is determined by the larger of the two values:
 // 1. MaxResourceVolumeMB (Temp Disk Space)
 // 2. MaxCachedDiskBytes (Cached Disk Space)
 // For Ephemeral disk creation, CRP will use the larger of the two values to ensure we have enough space for the ephemeral disk.
 // Note that generally only older SKUs use the Temp Disk space for ephemeral disks, and newer SKUs use the Cached Disk in most cases.
 // The ephemeral OS disk is created with the free space of the larger of the two values in that place.
-func MaxEphemeralOSDiskSizeGB(sku *skewer.SKU) (sizeGB float64, placement armcompute.DiffDiskPlacement) {
+func GetEphemeralOSDiskSizeAndPlacement(sku *skewer.SKU) (float64, armcompute.DiffDiskPlacement) {
 	if sku == nil {
 		return 0, ""
 	}
-	diskPlacementType, err := sku.GetCapabilityString("SupportedEphemeralOSDiskPlacements")
+
+	placementStr, err := sku.GetCapabilityString("SupportedEphemeralOSDiskPlacements")
 	if err != nil {
-		fmt.Errorf("fetching DiskPlacement:, %w", err)
+		fmt.Printf("error fetching disk placement: %v\n", err)
+		return 0, ""
 	}
-	if diskPlacementType == "ResourceDisk" {
-		maxCachedDiskBytes, _ := sku.MaxCachedDiskBytes()
-		maxResourceVolumeMB, _ := sku.MaxResourceVolumeMB() // NOTE: this is a misnomer, MB is actually MiB, hence the conversion below
 
-		maxResourceVolumeBytes := maxResourceVolumeMB * int64(units.Mebibyte)
-		maxDiskBytes := math.Max(float64(maxCachedDiskBytes), float64(maxResourceVolumeBytes))
-		if maxDiskBytes == 0 {
-			return 0, ""
-		}
-		// convert bytes to GB
-		return maxDiskBytes / float64(units.Gibibyte), armcompute.DiffDiskPlacement(diskPlacementType)
-	} else if diskPlacementType == "NvmeDisk" {
-		maNvmeDiskMB, _ := sku.GetCapabilityString("NvmeSizePerDiskInMiB")
-		maxResourceVolumeMB, _ := strconv.Atoi(maNvmeDiskMB)
+	switch placementStr {
+	case string(armcompute.DiffDiskPlacementResourceDisk):
+		return calculateMaxFromResourceDisk(sku), armcompute.DiffDiskPlacement(placementStr)
 
-		maxDiskBytes := int64(maxResourceVolumeMB) * int64(units.Mebibyte)
-		if maxDiskBytes == 0 {
-			return 0, ""
-		}
-		// convert bytes to GB
-		return float64(maxDiskBytes) / float64(units.Gibibyte), armcompute.DiffDiskPlacement(diskPlacementType)
-	} else if diskPlacementType == "ResourceDisk,CacheDisk" {
-		maxCachedDiskBytes, _ := sku.MaxCachedDiskBytes()
-		maxResourceVolumeMB, _ := sku.MaxResourceVolumeMB() // NOTE: this is a misnomer, MB is actually MiB, hence the conversion below
+	case string(armcompute.DiffDiskPlacementNvmeDisk):
+		return calculateMaxFromNvmeDisk(sku), armcompute.DiffDiskPlacement(placementStr)
 
-		maxResourceVolumeBytes := maxResourceVolumeMB * int64(units.Mebibyte)
-		maxDiskBytes := maxResourceVolumeBytes - maxCachedDiskBytes
-		if maxDiskBytes == 0 {
-			return 0, ""
-		}
-		// convert bytes to GB
-		return float64(maxDiskBytes) / float64(units.Gibibyte), armcompute.DiffDiskPlacement(diskPlacementType)
+	case "ResourceDisk,CacheDisk":
+		return calculateMaxFromCombinedDisks(sku), armcompute.DiffDiskPlacement(placementStr)
+
+	default:
+		return 0, ""
 	}
-	return 0, ""
+}
+
+func calculateMaxFromResourceDisk(sku *skewer.SKU) float64 {
+	cachedBytes, _ := sku.MaxCachedDiskBytes()
+	resourceMib, _ := sku.MaxResourceVolumeMB()
+	resourceBytes := resourceMib * int64(units.Mebibyte)
+	maxBytes := math.Max(float64(cachedBytes), float64(resourceBytes))
+	return maxBytes / float64(units.Gibibyte)
+}
+
+func calculateMaxFromNvmeDisk(sku *skewer.SKU) float64 {
+	nvmeMibStr, _ := sku.GetCapabilityString("NvmeSizePerDiskInMiB")
+	nvmeMib, _ := strconv.Atoi(nvmeMibStr)
+	nvmeBytes := int64(nvmeMib) * int64(units.Mebibyte)
+	return float64(nvmeBytes) / float64(units.Gibibyte)
+}
+
+func calculateMaxFromCombinedDisks(sku *skewer.SKU) float64 {
+	cachedBytes, _ := sku.MaxCachedDiskBytes()
+	resourceMib, _ := sku.MaxResourceVolumeMB()
+	resourceBytes := resourceMib * int64(units.Mebibyte)
+	usableBytes := resourceBytes - cachedBytes
+	return float64(usableBytes) / float64(units.Gibibyte)
 }
 
 var (

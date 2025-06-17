@@ -182,7 +182,7 @@ func setRequirementsEncryptionAtHostSupported(requirements scheduling.Requiremen
 
 func setRequirementsEphemeralOSDiskSupported(requirements scheduling.Requirements, sku *skewer.SKU, vmsize *skewer.VMSizeType) {
 	if sku.IsEphemeralOSDiskSupported() && vmsize.Series != "Dlds_v5" { // Dlds_v5 does not support ephemeral OS disk, contrary to what it claims
-		sizeGB, _ := MaxEphemeralOSDiskSizeGB(sku)
+		sizeGB, _ := GetEphemeralOSDiskSizeAndPlacement(sku)
 		requirements[v1alpha2.LabelSKUStorageEphemeralOSMaxSize].Insert(fmt.Sprint(sizeGB))
 	}
 }
