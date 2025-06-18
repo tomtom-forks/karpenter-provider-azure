@@ -112,7 +112,7 @@ func (r Resolver) Resolve(ctx context.Context, nodeClass *v1alpha2.AKSNodeClass,
 	if err != nil {
 		return nil, err
 	}
-	diskSize, placement := instancetype.GetEphemeralOSDiskSizeAndPlacement(sku)
+	diskSize, placement := instancetype.GetEphemeralOSDiskSizeAndPlacement(ctx, sku)
 
 	template := &template.Parameters{
 		StaticParameters: staticParameters,

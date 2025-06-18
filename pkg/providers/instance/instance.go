@@ -340,6 +340,7 @@ func (p *DefaultProvider) createNetworkInterface(ctx context.Context, opts *crea
 
 // newVMObject is a helper func that creates a new armcompute.VirtualMachine
 // from key input.
+// nolint:unused
 func newVMObject(
 	vmName,
 	nicReference,
@@ -435,6 +436,7 @@ func setVMPropertiesOSDiskType(vmProperties *armcompute.VirtualMachineProperties
 }
 
 // setImageReference sets the image reference for the VM based on if we are using self hosted karpenter or the node auto provisioning addon
+// nolint:unused
 func setImageReference(vmProperties *armcompute.VirtualMachineProperties, imageID string, useSIG bool) {
 	if useSIG {
 		vmProperties.StorageProfile.ImageReference = &armcompute.ImageReference{

@@ -28,14 +28,10 @@ linters:
     - prealloc
 
 linters-settings:
-  exclude:
-    - "pkg/providers/imagefamily/*"
-    - "pkg/cloudprovider/*"
-    - "pkg/providers/instance/*"
   dupl:
     threshold: 100
   gocyclo:
-    min-complexity: 11
+    min-complexity: 14
   govet:
     enable-all: true
     disable:

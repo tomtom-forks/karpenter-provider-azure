@@ -362,14 +362,14 @@ func (p *DefaultProvider) isConfidential(sku *skewer.SKU) bool {
 // For Ephemeral disk creation, CRP will use the larger of the two values to ensure we have enough space for the ephemeral disk.
 // Note that generally only older SKUs use the Temp Disk space for ephemeral disks, and newer SKUs use the Cached Disk in most cases.
 // The ephemeral OS disk is created with the free space of the larger of the two values in that place.
-func GetEphemeralOSDiskSizeAndPlacement(sku *skewer.SKU) (float64, armcompute.DiffDiskPlacement) {
+func GetEphemeralOSDiskSizeAndPlacement(ctx context.Context, sku *skewer.SKU) (float64, armcompute.DiffDiskPlacement) {
 	if sku == nil {
 		return 0, ""
 	}
 
 	placementStr, err := sku.GetCapabilityString("SupportedEphemeralOSDiskPlacements")
 	if err != nil {
-		fmt.Printf("error fetching disk placement: %v\n", err)
+		logging.FromContext(ctx).Errorf("error fetching disk placement: %v", err)
 		return 0, ""
 	}
 
