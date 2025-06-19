@@ -352,7 +352,7 @@ func newVMObject(
 	nodeClass *v1alpha2.AKSNodeClass,
 	launchTemplate *launchtemplate.Template,
 	instanceType *corecloudprovider.InstanceType,
-	provisionMode string, useSIG bool) armcompute.VirtualMachine {
+	provisionMode string) armcompute.VirtualMachine {
 	if launchTemplate.IsWindows {
 		return armcompute.VirtualMachine{} // TODO(Windows)
 	}

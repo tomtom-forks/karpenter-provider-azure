@@ -123,8 +123,7 @@ func (c *CloudProvider) isK8sVersionDrifted(ctx context.Context, nodeClaim *karp
 // TODO (charliedmcb): remove nolint on gocyclo. Added for now in order to pass "make verify
 // Was looking at a way to breakdown the function to pass gocyclo, but didn't feel like the best code.
 // Feel reassessing this within the future with a potential minor refactor would be best to fix the gocyclo.
-// nolint: gocyclo
-// nolint:unused
+// nolint: gocyclo,unused
 func (c *CloudProvider) isImageVersionDrifted(
 	ctx context.Context, nodeClaim *karpv1.NodeClaim) (cloudprovider.DriftReason, error) {
 	logger := logging.FromContext(ctx)
