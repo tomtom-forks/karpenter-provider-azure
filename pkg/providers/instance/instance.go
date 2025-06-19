@@ -340,7 +340,7 @@ func (p *DefaultProvider) createNetworkInterface(ctx context.Context, opts *crea
 
 // newVMObject is a helper func that creates a new armcompute.VirtualMachine
 // from key input.
-// nolint:unused
+// nolint:all
 func newVMObject(
 	vmName,
 	nicReference,
@@ -352,7 +352,7 @@ func newVMObject(
 	nodeClass *v1alpha2.AKSNodeClass,
 	launchTemplate *launchtemplate.Template,
 	instanceType *corecloudprovider.InstanceType,
-	provisionMode string) armcompute.VirtualMachine {
+	provisionMode string, useSIG bool) armcompute.VirtualMachine {
 	if launchTemplate.IsWindows {
 		return armcompute.VirtualMachine{} // TODO(Windows)
 	}
