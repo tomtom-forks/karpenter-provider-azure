@@ -19,12 +19,13 @@ package instancetype
 import (
 	"context"
 	"fmt"
+	"math"
+
 	"github.com/Azure/skewer"
 	"github.com/samber/lo"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	"knative.dev/pkg/ptr"
-	"math"
 
 	"github.com/Azure/karpenter-provider-azure/pkg/apis/v1alpha2"
 	"github.com/Azure/karpenter-provider-azure/pkg/utils"

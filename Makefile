@@ -67,7 +67,8 @@ coverage:
 	go tool cover -html coverage.out -o coverage.html
 
 verify: toolchain tidy download ## Verify code. Includes dependencies, linting, formatting, etc
-	make az-swagger-generate-clients-raw
+	# Disable swagger generate to reduce ci overhead
+	# make az-swagger-generate-clients-raw
 	go generate ./...
 	hack/boilerplate.sh
 	cp $(KARPENTER_CORE_DIR)/pkg/apis/crds/* pkg/apis/crds

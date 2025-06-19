@@ -340,7 +340,7 @@ func (p *DefaultProvider) createNetworkInterface(ctx context.Context, opts *crea
 
 // newVMObject is a helper func that creates a new armcompute.VirtualMachine
 // from key input.
-// nolint:all
+// nolint:unused
 func newVMObject(
 	vmName,
 	nicReference,
@@ -352,7 +352,7 @@ func newVMObject(
 	nodeClass *v1alpha2.AKSNodeClass,
 	launchTemplate *launchtemplate.Template,
 	instanceType *corecloudprovider.InstanceType,
-	provisionMode string, useSIG bool) armcompute.VirtualMachine {
+	provisionMode string) armcompute.VirtualMachine {
 	if launchTemplate.IsWindows {
 		return armcompute.VirtualMachine{} // TODO(Windows)
 	}
@@ -514,8 +514,7 @@ func (p *DefaultProvider) launchInstance(
 
 	sshPublicKey := options.FromContext(ctx).SSHPublicKey
 	nodeIdentityIDs := options.FromContext(ctx).NodeIdentities
-	useSIG := options.FromContext(ctx).UseSIG
-	vm := newVMObject(resourceName, nicReference, zone, capacityType, p.location, sshPublicKey, nodeIdentityIDs, nodeClass, launchTemplate, instanceType, p.provisionMode, useSIG)
+	vm := newVMObject(resourceName, nicReference, zone, capacityType, p.location, sshPublicKey, nodeIdentityIDs, nodeClass, launchTemplate, instanceType, p.provisionMode)
 
 	logging.FromContext(ctx).Debugf("Creating virtual machine %s (%s)", resourceName, instanceType.Name)
 	// Uses AZ Client to create a new virtual machine using the vm object we prepared earlier
@@ -821,7 +820,6 @@ func ephemeralDiskSize(instanceType *corecloudprovider.InstanceType, userDiskSiz
 		size := int32(math.Round(maxSize / 1.073741824))
 		// decimal places are truncated, so we round down
 		return &size
-
 	} else {
 		return userDiskSize
 	}
