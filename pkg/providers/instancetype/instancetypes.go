@@ -21,10 +21,13 @@ import (
 	"fmt"
 	"math"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/compute/armcompute/v5"
 
 	"github.com/mitchellh/hashstructure/v2"
 	"github.com/samber/lo"
@@ -60,6 +63,8 @@ const (
 type Provider interface {
 	LivenessProbe(*http.Request) error
 	List(context.Context, *v1alpha2.AKSNodeClass) ([]*cloudprovider.InstanceType, error)
+	// Return Azure Skewer Representation of the instance type
+	Get(context.Context, *v1alpha2.AKSNodeClass, string) (*skewer.SKU, error)
 	//UpdateInstanceTypes(ctx context.Context) error
 	//UpdateInstanceTypeOfferings(ctx context.Context) error
 }
@@ -96,6 +101,16 @@ func NewDefaultProvider(region string, cache *cache.Cache, skuClient skuclient.S
 		cm:                   pretty.NewChangeMonitor(),
 		instanceTypesSeqNum:  0,
 	}
+}
+func (p *DefaultProvider) Get(ctx context.Context, nodeClass *v1alpha2.AKSNodeClass, instanceType string) (*skewer.SKU, error) {
+	skus, err := p.getInstanceTypes(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if sku, ok := skus[instanceType]; ok {
+		return sku, nil
+	}
+	return nil, fmt.Errorf("instance type %s not found", instanceType)
 }
 
 // Get all instance type options
@@ -341,27 +356,60 @@ func (p *DefaultProvider) isConfidential(sku *skewer.SKU) bool {
 	return strings.HasPrefix(size, "DC") || strings.HasPrefix(size, "EC")
 }
 
-// MaxEphemeralOSDiskSizeGB returns the maximum ephemeral OS disk size for a given SKU.
+// GetEphemeralOSDiskSizeAndPlacement returns the maximum ephemeral OS disk size for a given SKU.
 // Ephemeral OS disk size is determined by the larger of the two values:
 // 1. MaxResourceVolumeMB (Temp Disk Space)
 // 2. MaxCachedDiskBytes (Cached Disk Space)
 // For Ephemeral disk creation, CRP will use the larger of the two values to ensure we have enough space for the ephemeral disk.
 // Note that generally only older SKUs use the Temp Disk space for ephemeral disks, and newer SKUs use the Cached Disk in most cases.
 // The ephemeral OS disk is created with the free space of the larger of the two values in that place.
-func MaxEphemeralOSDiskSizeGB(sku *skewer.SKU) float64 {
+func GetEphemeralOSDiskSizeAndPlacement(ctx context.Context, sku *skewer.SKU) (float64, armcompute.DiffDiskPlacement) {
 	if sku == nil {
-		return 0
+		return 0, ""
 	}
-	maxCachedDiskBytes, _ := sku.MaxCachedDiskBytes()
-	maxResourceVolumeMB, _ := sku.MaxResourceVolumeMB() // NOTE: this is a misnomer, MB is actually MiB, hence the conversion below
 
-	maxResourceVolumeBytes := maxResourceVolumeMB * int64(units.Mebibyte)
-	maxDiskBytes := math.Max(float64(maxCachedDiskBytes), float64(maxResourceVolumeBytes))
-	if maxDiskBytes == 0 {
-		return 0
+	placementStr, err := sku.GetCapabilityString("SupportedEphemeralOSDiskPlacements")
+	if err != nil {
+		logging.FromContext(ctx).Errorf("error fetching disk placement: %v", err)
+		return 0, ""
 	}
-	// convert bytes to GB
-	return maxDiskBytes / float64(units.Gigabyte)
+
+	switch placementStr {
+	case string(armcompute.DiffDiskPlacementResourceDisk):
+		return calculateMaxFromResourceDisk(sku), armcompute.DiffDiskPlacement(placementStr)
+
+	case string(armcompute.DiffDiskPlacementNvmeDisk):
+		return calculateMaxFromNvmeDisk(sku), armcompute.DiffDiskPlacement(placementStr)
+
+	case "ResourceDisk,CacheDisk":
+		return calculateMaxFromCombinedDisks(sku), armcompute.DiffDiskPlacement(placementStr)
+
+	default:
+		return 0, ""
+	}
+}
+
+func calculateMaxFromResourceDisk(sku *skewer.SKU) float64 {
+	cachedBytes, _ := sku.MaxCachedDiskBytes()
+	resourceMib, _ := sku.MaxResourceVolumeMB()
+	resourceBytes := resourceMib * int64(units.Mebibyte)
+	maxBytes := math.Max(float64(cachedBytes), float64(resourceBytes))
+	return maxBytes / float64(units.Gibibyte)
+}
+
+func calculateMaxFromNvmeDisk(sku *skewer.SKU) float64 {
+	nvmeMibStr, _ := sku.GetCapabilityString("NvmeSizePerDiskInMiB")
+	nvmeMib, _ := strconv.Atoi(nvmeMibStr)
+	nvmeBytes := int64(nvmeMib) * int64(units.Mebibyte)
+	return float64(nvmeBytes) / float64(units.Gibibyte)
+}
+
+func calculateMaxFromCombinedDisks(sku *skewer.SKU) float64 {
+	cachedBytes, _ := sku.MaxCachedDiskBytes()
+	resourceMib, _ := sku.MaxResourceVolumeMB()
+	resourceBytes := resourceMib * int64(units.Mebibyte)
+	usableBytes := resourceBytes - cachedBytes
+	return float64(usableBytes) / float64(units.Gibibyte)
 }
 
 var (

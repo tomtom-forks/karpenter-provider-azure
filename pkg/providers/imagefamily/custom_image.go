@@ -42,7 +42,6 @@ func (u CustomImages) Name() string {
 }
 
 func (u CustomImages) DefaultImages() []DefaultImageOutput {
-
 	// Have to implement same interface
 	return []DefaultImageOutput{
 		{

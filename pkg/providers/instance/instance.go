@@ -51,7 +51,7 @@ import (
 	"github.com/Azure/azure-sdk-for-go/services/compute/mgmt/2022-08-01/compute"
 
 	sdkerrors "github.com/Azure/azure-sdk-for-go-extensions/pkg/errors"
-	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/compute/armcompute"
+	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/compute/armcompute/v5"
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/network/armnetwork"
 )
 
@@ -340,6 +340,7 @@ func (p *DefaultProvider) createNetworkInterface(ctx context.Context, opts *crea
 
 // newVMObject is a helper func that creates a new armcompute.VirtualMachine
 // from key input.
+// nolint:unused
 func newVMObject(
 	vmName,
 	nicReference,
@@ -351,7 +352,7 @@ func newVMObject(
 	nodeClass *v1alpha2.AKSNodeClass,
 	launchTemplate *launchtemplate.Template,
 	instanceType *corecloudprovider.InstanceType,
-	provisionMode string, useSIG bool) armcompute.VirtualMachine {
+	provisionMode string) armcompute.VirtualMachine {
 	if launchTemplate.IsWindows {
 		return armcompute.VirtualMachine{} // TODO(Windows)
 	}
@@ -408,7 +409,7 @@ func newVMObject(
 		Zones: utils.MakeVMZone(zone),
 		Tags:  launchTemplate.Tags,
 	}
-	setVMPropertiesOSDiskType(vm.Properties, launchTemplate.StorageProfile)
+	setVMPropertiesOSDiskType(vm.Properties, launchTemplate)
 	//setImageReference(vm.Properties, launchTemplate.ImageID, useSIG)
 	setVMPropertiesBillingProfile(vm.Properties, capacityType)
 
@@ -422,17 +423,20 @@ func newVMObject(
 }
 
 // setVMPropertiesOSDiskType enables ephemeral os disk for instance types that support it
-func setVMPropertiesOSDiskType(vmProperties *armcompute.VirtualMachineProperties, storageProfile string) {
-	if storageProfile == "Ephemeral" {
+func setVMPropertiesOSDiskType(vmProperties *armcompute.VirtualMachineProperties, launchTemplate *launchtemplate.Template) {
+	diskType, placement, sizeGB := launchTemplate.StorageProfileDiskType, launchTemplate.StorageProfilePlacement, launchTemplate.StorageProfileSizeGB
+	if diskType == "Ephemeral" {
+		vmProperties.StorageProfile.OSDisk.DiskSizeGB = lo.ToPtr(int32(sizeGB))
 		vmProperties.StorageProfile.OSDisk.DiffDiskSettings = &armcompute.DiffDiskSettings{
-			Option: lo.ToPtr(armcompute.DiffDiskOptionsLocal),
-			// placement (cache/resource) is left to CRP
+			Option:    lo.ToPtr(armcompute.DiffDiskOptionsLocal),
+			Placement: lo.ToPtr(placement),
 		}
 		vmProperties.StorageProfile.OSDisk.Caching = lo.ToPtr(armcompute.CachingTypesReadOnly)
 	}
 }
 
 // setImageReference sets the image reference for the VM based on if we are using self hosted karpenter or the node auto provisioning addon
+// nolint:unused
 func setImageReference(vmProperties *armcompute.VirtualMachineProperties, imageID string, useSIG bool) {
 	if useSIG {
 		vmProperties.StorageProfile.ImageReference = &armcompute.ImageReference{
@@ -510,8 +514,7 @@ func (p *DefaultProvider) launchInstance(
 
 	sshPublicKey := options.FromContext(ctx).SSHPublicKey
 	nodeIdentityIDs := options.FromContext(ctx).NodeIdentities
-	useSIG := options.FromContext(ctx).UseSIG
-	vm := newVMObject(resourceName, nicReference, zone, capacityType, p.location, sshPublicKey, nodeIdentityIDs, nodeClass, launchTemplate, instanceType, p.provisionMode, useSIG)
+	vm := newVMObject(resourceName, nicReference, zone, capacityType, p.location, sshPublicKey, nodeIdentityIDs, nodeClass, launchTemplate, instanceType, p.provisionMode)
 
 	logging.FromContext(ctx).Debugf("Creating virtual machine %s (%s)", resourceName, instanceType.Name)
 	// Uses AZ Client to create a new virtual machine using the vm object we prepared earlier
@@ -817,7 +820,6 @@ func ephemeralDiskSize(instanceType *corecloudprovider.InstanceType, userDiskSiz
 		size := int32(math.Round(maxSize / 1.073741824))
 		// decimal places are truncated, so we round down
 		return &size
-
 	} else {
 		return userDiskSize
 	}

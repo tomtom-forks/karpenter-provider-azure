@@ -21,6 +21,8 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/compute/armcompute/v5"
+
 	"github.com/Azure/go-autorest/autorest/to"
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/imagefamily"
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/launchtemplate/parameters"
@@ -54,7 +56,9 @@ type Template struct {
 	CustomScriptsCustomData string
 	CustomScriptsCSE        string
 	IsWindows               bool
-	StorageProfile          string
+	StorageProfileDiskType  string
+	StorageProfilePlacement armcompute.DiffDiskPlacement
+	StorageProfileSizeGB    float64
 }
 
 type Provider struct {
@@ -190,11 +194,13 @@ func (p *Provider) createLaunchTemplate(ctx context.Context, params *parameters.
 	// merge and convert to ARM tags
 	azureTags := mergeTags(params.Tags, map[string]string{karpenterManagedTagKey: params.ClusterName})
 	template := &Template{
-		ImageID:        params.ImageID,
-		Tags:           azureTags,
-		SubnetID:       params.SubnetID,
-		IsWindows:      params.IsWindows,
-		StorageProfile: params.StorageProfile,
+		ImageID:                 params.ImageID,
+		Tags:                    azureTags,
+		SubnetID:                params.SubnetID,
+		IsWindows:               params.IsWindows,
+		StorageProfileDiskType:  params.StorageProfileDiskType,
+		StorageProfilePlacement: params.StorageProfilePlacement,
+		StorageProfileSizeGB:    params.StorageProfileSizeGB,
 	}
 
 	if p.provisionMode == consts.ProvisionModeBootstrappingClient {
