@@ -168,6 +168,11 @@ func (r *defaultResolver) Resolve(
 	if err != nil {
 		return nil, err
 	}
+	sku, err := r.instanceTypeProvider.Get(ctx, nodeClass, instanceType.Name)
+	if err != nil {
+		return nil, err
+	}
+	diskSize, placement := instancetype.GetEphemeralOSDiskSizeAndPlacement(ctx, sku)
 
 	template := &template.Parameters{
 		StaticParameters: staticParameters,

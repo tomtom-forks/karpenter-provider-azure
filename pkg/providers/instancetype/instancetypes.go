@@ -20,10 +20,13 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/compute/armcompute/v5"
 
 	"github.com/mitchellh/hashstructure/v2"
 	"github.com/samber/lo"
@@ -104,6 +107,16 @@ func NewDefaultProvider(
 		cm:                   pretty.NewChangeMonitor(),
 		instanceTypesSeqNum:  0,
 	}
+}
+func (p *DefaultProvider) Get(ctx context.Context, nodeClass *v1alpha2.AKSNodeClass, instanceType string) (*skewer.SKU, error) {
+	skus, err := p.getInstanceTypes(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if sku, ok := skus[instanceType]; ok {
+		return sku, nil
+	}
+	return nil, fmt.Errorf("instance type %s not found", instanceType)
 }
 
 // Get all instance type options

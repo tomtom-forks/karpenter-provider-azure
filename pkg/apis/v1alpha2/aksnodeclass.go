@@ -129,6 +129,37 @@ type Security struct {
 	EncryptionAtHost *bool `json:"encryptionAtHost,omitempty"`
 }
 
+// CustomImageTerm defines selection logic for Custom Image used by Karpenter to launch nodes.
+// If multiple fields are used for selection, the requirements are ANDed.
+type CustomImageTerm struct {
+	// GallerySubscriptionID is Image Gallery Subscription ID.
+	// +kubebuilder:validation:Pattern="^\\w{8}-\\w{4}-\\w{4}-\\w{4}-\\w{12}$"
+	// +optional
+	GallerySubscriptionID string `json:"gallerySubscriptionID,omitempty"`
+	// GalleryResourceGroupName is Image Gallery Resource Group Name.
+	// This value is the name field, which is different from the name tag.
+	// +optional
+	GalleryResourceGroupName string `json:"galleryResourceGroupName,omitempty"`
+	// GalleryName is Image Gallery Name.
+	// This value is the name field, which is different from the name tag.
+	// +optional
+	GalleryName string `json:"galleryName,omitempty"`
+	// Name is the Image name in Azure Image Gallery.
+	// This value is the name field, which is different from the name tag.
+	// +optional
+	Name string `json:"name,omitempty"`
+	// DistroName is the aks container service agent pool distro name which need to be valid.
+	// Here are all distro https://github.com/Azure/AgentBaker/blob/dev/pkg/agent/datamodel/types.go#L144.
+	// +kubebuilder:validation:Enum=aks-ubuntu-containerd-22.04-gen2;aks-ubuntu-arm64-containerd-22.04-gen2
+	// +kubebuilder:default="aks-ubuntu-containerd-22.04-gen2"
+	// +optional
+	DistroName string `json:"distroName,omitempty"`
+	// Version is Image version.
+	// You can leave it empty and get latest image version
+	// +optional
+	Version string `json:"version,omitempty"`
+}
+
 // KubeletConfiguration defines args to be used when configuring kubelet on provisioned nodes.
 // They are a subset of the upstream types, recognizing not all options may be supported.
 // Wherever possible, the types and names should reflect the upstream kubelet types.
