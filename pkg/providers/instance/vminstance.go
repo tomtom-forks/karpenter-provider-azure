@@ -20,7 +20,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"net/http"
+	"reflect"
+	"strconv"
 	"time"
 
 	sdkerrors "github.com/Azure/azure-sdk-for-go-extensions/pkg/errors"
@@ -521,10 +524,11 @@ func newVMObject(opts *createVMOptions) *armcompute.VirtualMachine {
 			StorageProfile: &armcompute.StorageProfile{
 				OSDisk: &armcompute.OSDisk{
 					Name:         lo.ToPtr(opts.VMName),
-					DiskSizeGB:   opts.NodeClass.Spec.OSDiskSizeGB,
+					DiskSizeGB:   ephemeralDiskSize(opts.InstanceType, opts.NodeClass.Spec.OSDiskSizeGB, opts.NodeClass.Spec.OSDiskSizeDynamic),
 					CreateOption: lo.ToPtr(armcompute.DiskCreateOptionTypesFromImage),
 					DeleteOption: lo.ToPtr(armcompute.DiskDeleteOptionTypesDelete),
 				},
+				ImageReference: makeImageIDRef(&opts.NodeClass.Spec.CustomImageTerm, opts.LaunchTemplate.ImageID),
 			},
 
 			NetworkProfile: &armcompute.NetworkProfile{
@@ -561,7 +565,7 @@ func newVMObject(opts *createVMOptions) *armcompute.VirtualMachine {
 	}
 	setVMPropertiesOSDiskType(vm.Properties, opts.LaunchTemplate)
 	setVMPropertiesOSDiskEncryption(vm.Properties, opts.DiskEncryptionSetID)
-	setImageReference(vm.Properties, opts.LaunchTemplate.ImageID, opts.UseSIG)
+	//setImageReference(vm.Properties, opts.LaunchTemplate.ImageID, opts.UseSIG)
 	setVMPropertiesBillingProfile(vm.Properties, opts.CapacityType)
 	setVMPropertiesSecurityProfile(vm.Properties, opts.NodeClass)
 
@@ -971,4 +975,34 @@ func GetCapacityTypeFromVM(vm *armcompute.VirtualMachine) string {
 		return VMPriorityToKarpCapacityType[*vm.Properties.Priority]
 	}
 	return ""
+}
+
+func ephemeralDiskSize(instanceType *corecloudprovider.InstanceType, userDiskSize *int32, dynamicDiskSize bool) *int32 {
+	if dynamicDiskSize {
+		reqs := instanceType.Requirements.Get(v1beta1.LabelSKUStorageEphemeralOSMaxSize).Values()
+		if len(reqs) == 0 || len(reqs) > 1 {
+			return userDiskSize
+		}
+		maxSize, err := strconv.ParseFloat(reqs[0], 32)
+		if err != nil {
+			return userDiskSize
+		}
+		size := int32(math.Round(maxSize / 1.073741824))
+		// decimal places are truncated, so we round down
+		return &size
+	} else {
+		return userDiskSize
+	}
+}
+
+func makeImageIDRef(imageTerm *v1beta1.CustomImageTerm, imageID string) *armcompute.ImageReference {
+	if reflect.DeepEqual(imageTerm, v1beta1.CustomImageTerm{}) {
+		return &armcompute.ImageReference{
+			CommunityGalleryImageID: &imageID,
+		}
+	} else {
+		return &armcompute.ImageReference{
+			ID: &imageID,
+		}
+	}
 }

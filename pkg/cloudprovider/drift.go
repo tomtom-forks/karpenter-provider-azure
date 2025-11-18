@@ -48,14 +48,13 @@ const (
 	NoDrift cloudprovider.DriftReason = ""
 )
 
+// nolint:unused
 func (c *CloudProvider) isNodeClassDrifted(ctx context.Context, nodeClaim *karpv1.NodeClaim, nodeClass *v1beta1.AKSNodeClass) (cloudprovider.DriftReason, error) {
 	// TODO: if we find more expensive checks, such as reading VMs or NICs from Azure, are being duplicated between checks, we should
 	//       produce a lazy at-most-once that allows a check to cache a value for later checks to read.
 	checks := []func(ctx context.Context, nodeClaim *karpv1.NodeClaim, nodeClass *v1beta1.AKSNodeClass) (cloudprovider.DriftReason, error){
-		c.areStaticFieldsDrifted,
 		c.isK8sVersionDrifted,
 		c.isKubeletIdentityDrifted,
-		c.isImageVersionDrifted,
 		c.isSubnetDrifted,
 	}
 	for _, check := range checks {
@@ -71,6 +70,7 @@ func (c *CloudProvider) isNodeClassDrifted(ctx context.Context, nodeClaim *karpv
 	return "", nil
 }
 
+// nolint:unused
 func (c *CloudProvider) areStaticFieldsDrifted(ctx context.Context, nodeClaim *karpv1.NodeClaim, nodeClass *v1beta1.AKSNodeClass) (cloudprovider.DriftReason, error) {
 	logger := log.FromContext(ctx)
 
@@ -130,7 +130,7 @@ func (c *CloudProvider) isK8sVersionDrifted(ctx context.Context, nodeClaim *karp
 // TODO (charliedmcb): remove nolint on gocyclo. Added for now in order to pass "make verify
 // Was looking at a way to breakdown the function to pass gocyclo, but didn't feel like the best code.
 // Feel reassessing this within the future with a potential minor refactor would be best to fix the gocyclo.
-// nolint: gocyclo
+// nolint: gocyclo,unused
 func (c *CloudProvider) isImageVersionDrifted(
 	ctx context.Context,
 	nodeClaim *karpv1.NodeClaim,

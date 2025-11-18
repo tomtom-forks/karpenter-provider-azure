@@ -153,6 +153,7 @@ func (r *NodeImageReconciler) Reconcile(ctx context.Context, nodeClass *v1beta1.
 	shouldUpdate := imageVersionsUnready(nodeClass)
 	if !shouldUpdate {
 		// Case 4: Check if the maintenance window is open
+		var err error
 		shouldUpdate, err = r.isMaintenanceWindowOpen(ctx)
 		if err != nil {
 			return reconcile.Result{}, fmt.Errorf("checking maintenance window, %w", err)

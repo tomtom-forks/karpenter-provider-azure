@@ -60,6 +60,49 @@ spec:
               AKSNodeClassSpec is the top level specification for the AKS Karpenter Provider.
               This will contain configuration necessary to launch instances in AKS.
             properties:
+              OSDiskSizeDynamic:
+                default: false
+                description: OSDiskSizeDynamic is enable dynamic os disk size based
+                  on SKU max allowed disk
+                type: boolean
+              customImageTerm:
+                description: CustomImageTerm is for user defined Azure Custom Images
+                properties:
+                  distroName:
+                    default: aks-ubuntu-containerd-22.04-gen2
+                    description: |-
+                      DistroName is the aks container service agent pool distro name which need to be valid.
+                      Here are all distro https://github.com/Azure/AgentBaker/blob/dev/pkg/agent/datamodel/types.go#L144.
+                    enum:
+                    - aks-ubuntu-containerd-22.04-gen2
+                    - aks-ubuntu-arm64-containerd-22.04-gen2
+                    type: string
+                  galleryName:
+                    description: |-
+                      GalleryName is Image Gallery Name.
+                      This value is the name field, which is different from the name tag.
+                    type: string
+                  galleryResourceGroupName:
+                    description: |-
+                      GalleryResourceGroupName is Image Gallery Resource Group Name.
+                      This value is the name field, which is different from the name tag.
+                    type: string
+                  gallerySubscriptionID:
+                    description: GallerySubscriptionID is Image Gallery Subscription
+                      ID.
+                    pattern: ^\w{8}-\w{4}-\w{4}-\w{4}-\w{12}$
+                    type: string
+                  name:
+                    description: |-
+                      Name is the Image name in Azure Image Gallery.
+                      This value is the name field, which is different from the name tag.
+                    type: string
+                  version:
+                    description: |-
+                      Version is Image version.
+                      You can leave it empty and get latest image version
+                    type: string
+                type: object
               fipsMode:
                 description: FIPSMode controls FIPS compliance for the provisioned
                   nodes
@@ -75,6 +118,7 @@ spec:
                 - Ubuntu2204
                 - Ubuntu2404
                 - AzureLinux
+                - Custom
                 type: string
               kubelet:
                 description: |-
@@ -91,6 +135,11 @@ spec:
                     items:
                       type: string
                     type: array
+                  clusterDNS:
+                    description: |-
+                      clusterDNS is an IP addresses for the cluster DNS server.
+                      Note that not all providers may use all addresses.
+                    type: string
                   containerLogMaxFiles:
                     default: 5
                     description: |-
@@ -195,11 +244,10 @@ spec:
                 minimum: 10
                 type: integer
               osDiskSizeGB:
-                default: 128
+                default: 50
                 description: osDiskSizeGB is the size of the OS disk in GB.
                 format: int32
-                maximum: 2048
-                minimum: 30
+                minimum: 50
                 type: integer
               security:
                 description: Collection of security related karpenter fields
@@ -398,6 +446,49 @@ spec:
               AKSNodeClassSpec is the top level specification for the AKS Karpenter Provider.
               This will contain configuration necessary to launch instances in AKS.
             properties:
+              OSDiskSizeDynamic:
+                default: false
+                description: OSDiskSizeDynamic is enable dynamic os disk size based
+                  on SKU max allowed disk
+                type: boolean
+              customImageTerm:
+                description: CustomImageTerm is for user defined Azure Custom Images
+                properties:
+                  distroName:
+                    default: aks-ubuntu-containerd-22.04-gen2
+                    description: |-
+                      DistroName is the aks container service agent pool distro name which need to be valid.
+                      Here are all distro https://github.com/Azure/AgentBaker/blob/dev/pkg/agent/datamodel/types.go#L144.
+                    enum:
+                    - aks-ubuntu-containerd-22.04-gen2
+                    - aks-ubuntu-arm64-containerd-22.04-gen2
+                    type: string
+                  galleryName:
+                    description: |-
+                      GalleryName is Image Gallery Name.
+                      This value is the name field, which is different from the name tag.
+                    type: string
+                  galleryResourceGroupName:
+                    description: |-
+                      GalleryResourceGroupName is Image Gallery Resource Group Name.
+                      This value is the name field, which is different from the name tag.
+                    type: string
+                  gallerySubscriptionID:
+                    description: GallerySubscriptionID is Image Gallery Subscription
+                      ID.
+                    pattern: ^\w{8}-\w{4}-\w{4}-\w{4}-\w{12}$
+                    type: string
+                  name:
+                    description: |-
+                      Name is the Image name in Azure Image Gallery.
+                      This value is the name field, which is different from the name tag.
+                    type: string
+                  version:
+                    description: |-
+                      Version is Image version.
+                      You can leave it empty and get latest image version
+                    type: string
+                type: object
               fipsMode:
                 description: FIPSMode controls FIPS compliance for the provisioned
                   nodes
@@ -413,6 +504,7 @@ spec:
                 - Ubuntu2204
                 - Ubuntu2404
                 - AzureLinux
+                - Custom
                 type: string
               kubelet:
                 description: |-
@@ -429,6 +521,11 @@ spec:
                     items:
                       type: string
                     type: array
+                  clusterDNS:
+                    description: |-
+                      clusterDNS is an IP addresses for the cluster DNS server.
+                      Note that not all providers may use all addresses.
+                    type: string
                   containerLogMaxFiles:
                     default: 5
                     description: |-
@@ -533,11 +630,10 @@ spec:
                 minimum: 10
                 type: integer
               osDiskSizeGB:
-                default: 128
+                default: 50
                 description: osDiskSizeGB is the size of the OS disk in GB.
                 format: int32
-                maximum: 2048
-                minimum: 30
+                minimum: 50
                 type: integer
               security:
                 description: Collection of security related karpenter fields

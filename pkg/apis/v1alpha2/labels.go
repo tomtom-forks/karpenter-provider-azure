@@ -21,4 +21,5 @@ const (
 	Ubuntu2204ImageFamily = "Ubuntu2204"
 	Ubuntu2404ImageFamily = "Ubuntu2404"
 	AzureLinuxImageFamily = "AzureLinux"
+	CustomImageFamily     = "Custom"
 )

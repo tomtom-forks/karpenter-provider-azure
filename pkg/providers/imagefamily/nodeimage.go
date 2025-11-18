@@ -19,6 +19,10 @@ package imagefamily
 import (
 	"context"
 	"fmt"
+	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
+	v1 "k8s.io/api/core/v1"
+	karpv1 "sigs.k8s.io/karpenter/pkg/apis/v1"
+	"strings"
 	"time"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/compute/armcompute/v7"
@@ -103,7 +107,9 @@ func (p *provider) List(ctx context.Context, nodeClass *v1beta1.AKSNodeClass) ([
 	}
 
 	var nodeImages []NodeImage
-	if useSIG {
+	if *nodeClass.Spec.ImageFamily == "Custom" {
+		nodeImages, err = p.listTTIG(ctx, nodeClass)
+	} else if useSIG {
 		log.FromContext(ctx).V(1).Info("using SIG to list node images")
 		nodeImages, err = p.listSIG(ctx, supportedImages)
 		if err != nil {
@@ -211,4 +217,72 @@ func BuildImageIDCIG(publicGalleryURL, communityImageName, imageVersion string) 
 // BuildImageIDSIG builds a Shared Image Gallery image ID
 func BuildImageIDSIG(subscriptionID, resourceGroup, galleryName, imageDefinition, imageVersion string) string {
 	return fmt.Sprintf(sharedImageGalleryImageIDFormat, subscriptionID, resourceGroup, galleryName, imageDefinition, imageVersion)
+}
+
+func (p *provider) listTTIG(ctx context.Context, nodeClass *v1beta1.AKSNodeClass) ([]NodeImage, error) {
+	nodeImages := []NodeImage{}
+	imageTerm := nodeClass.Spec.CustomImageTerm
+
+	key := BuildImageIDSIG(imageTerm.GallerySubscriptionID, imageTerm.GalleryResourceGroupName, imageTerm.GalleryName, imageTerm.Name, imageTerm.Version)
+	log.FromContext(ctx).WithValues("cache key", key).Info("debuuug: retrieved cache key for TTIG image")
+	if cachedImage, found := p.nodeImagesCache.Get(key); found {
+		return cachedImage.([]NodeImage), nil
+	}
+
+	cred, err := azidentity.NewDefaultAzureCredential(nil)
+
+	if err != nil {
+		log.FromContext(ctx).Error(err, "failed to obtain a credential:")
+	}
+	clientFactory, err := armcompute.NewClientFactory(imageTerm.GallerySubscriptionID, cred, nil)
+
+	if err != nil {
+		log.FromContext(ctx).Error(err, "failed to create client:")
+	}
+	imageCandidate := armcompute.GalleryImageVersion{}
+
+	if imageTerm.Version != "" {
+		imageInfo, err := clientFactory.NewGalleryImageVersionsClient().Get(ctx, imageTerm.GalleryResourceGroupName, imageTerm.GalleryName, imageTerm.Name, imageTerm.Version, nil)
+		log.FromContext(ctx).WithValues("imageInfo", imageInfo).Info("debuuug: retrieved image info")
+		if err != nil {
+			return nil, err
+		}
+		imageCandidate = imageInfo.GalleryImageVersion
+		log.FromContext(ctx).WithValues("imageCandidate", imageCandidate).Info("debuuug: retrieved imageCandidate")
+	} else {
+		pager := clientFactory.NewGalleryImageVersionsClient().NewListByGalleryImagePager(imageTerm.GalleryResourceGroupName, imageTerm.GalleryName, imageTerm.Name, nil)
+		for pager.More() {
+			page, err := pager.NextPage(context.Background())
+			if err != nil {
+				return nil, err
+			}
+			for _, imageVersion := range page.GalleryImageVersionList.Value {
+				if lo.IsEmpty(imageCandidate.ID) || imageVersion.Properties.PublishingProfile.PublishedDate.After(*imageCandidate.Properties.PublishingProfile.PublishedDate) {
+					imageCandidate = *imageVersion
+				}
+			}
+		}
+	}
+
+	imageID := lo.FromPtr(imageCandidate.ID)
+	if p.cm.HasChanged(key, imageID) {
+		log.FromContext(ctx).WithValues("image-id", imageID).Info("discovered new image id")
+	}
+	imageArch := karpv1.ArchitectureAmd64
+
+	if strings.Contains(imageTerm.DistroName, "arm64") {
+		imageArch = karpv1.ArchitectureArm64
+	}
+	nodeImage := NodeImage{
+		ID: imageID,
+		Requirements: scheduling.NewRequirements(
+			scheduling.NewRequirement(v1.LabelArchStable, v1.NodeSelectorOpIn, imageArch),
+			scheduling.NewRequirement(v1beta1.LabelSKUHyperVGeneration, v1.NodeSelectorOpIn, v1beta1.HyperVGenerationV2),
+		),
+	}
+	nodeImages = append(nodeImages, nodeImage)
+
+	p.nodeImagesCache.Set(key, nodeImages, ImageExpirationInterval)
+	return nodeImages, nil
+
 }

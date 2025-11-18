@@ -129,9 +129,18 @@ func (r *defaultResolver) Resolve(
 
 	// TODO: as ProvisionModeBootstrappingClient path develops, we will eventually be able to drop the retrieval of imageDistro here.
 	useSIG := options.FromContext(ctx).UseSIG
-	imageDistro, err := mapToImageDistro(imageID, nodeClass.Spec.FIPSMode, imageFamily, useSIG)
-	if err != nil {
-		return nil, err
+	imageDistro := ""
+	if *nodeClass.Spec.ImageFamily == "Custom" {
+		if nodeClass.Spec.CustomImageTerm.DistroName == "" {
+			return nil, fmt.Errorf("custom image family requires specifying .spec.customImageTerm.distroName")
+		}
+		imageDistro = nodeClass.Spec.CustomImageTerm.DistroName
+	} else {
+		imageDistro, err = mapToImageDistro(imageID, nodeClass.Spec.FIPSMode, imageFamily, useSIG)
+		if err != nil {
+			return nil, err
+		}
+
 	}
 
 	generalTaints := nodeClaim.Spec.Taints
@@ -149,7 +158,13 @@ func (r *defaultResolver) Resolve(
 		allTaints = append(allTaints, karpv1.UnregisteredNoExecuteTaint)
 	}
 
+	sku, err := r.instanceTypeProvider.Get(ctx, nodeClass, instanceType.Name)
+	if err != nil {
+		return nil, err
+	}
 	diskType, placement, err := r.getStorageProfile(ctx, instanceType, nodeClass)
+	diskSize, _ := instancetype.FindMaxEphemeralSizeGBAndPlacement(sku)
+
 	if err != nil {
 		return nil, err
 	}
@@ -180,7 +195,7 @@ func (r *defaultResolver) Resolve(
 
 		// TODO: We could potentially use the instance type to do defaulting like
 		// traditional AKS, so putting this here along with the other settings
-		StorageProfileSizeGB: lo.FromPtr(nodeClass.Spec.OSDiskSizeGB),
+		StorageProfileSizeGB: int32(diskSize),
 		ImageID:              imageID,
 		IsWindows:            false, // TODO(Windows)
 	}
@@ -247,6 +262,8 @@ func GetImageFamily(familyName *string, fipsMode *v1beta1.FIPSMode, kubernetesVe
 			return &AzureLinux3{Options: parameters}
 		}
 		return &AzureLinux{Options: parameters}
+	case v1beta1.CustomImageFamily:
+		return &CustomImages{Options: parameters}
 	case v1beta1.UbuntuImageFamily:
 		fallthrough
 	default:
