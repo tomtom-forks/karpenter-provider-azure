@@ -139,6 +139,7 @@ func (r *NodeImageReconciler) Reconcile(ctx context.Context, nodeClass *v1beta1.
 			}
 			return reqs[i].Key < reqs[j].Key
 		})
+
 		return v1beta1.NodeImage{
 			ID:           nodeImage.ID,
 			Requirements: reqs,
@@ -163,7 +164,6 @@ func (r *NodeImageReconciler) Reconcile(ctx context.Context, nodeClass *v1beta1.
 		// Scenario B: Calculate any partial update based on image selectors, or newly supports SKUs
 		goalImages = overrideAnyGoalStateVersionsWithExisting(nodeClass, goalImages)
 	}
-
 	if len(goalImages) == 0 {
 		nodeClass.Status.Images = nil
 		nodeClass.StatusConditions().SetFalse(v1beta1.ConditionTypeImagesReady, "ImagesNotFound", "ImageSelectors did not match any Images")
@@ -258,7 +258,6 @@ func (r *NodeImageReconciler) isMaintenanceWindowOpen(ctx context.Context) (bool
 // TODO: Need longer term design for handling newly supported versions, and other image selectors.
 func overrideAnyGoalStateVersionsWithExisting(nodeClass *v1beta1.AKSNodeClass, discoveredImages []v1beta1.NodeImage) []v1beta1.NodeImage {
 	existingBaseIDMapping := mapImageBasesToImages(nodeClass.Status.Images)
-
 	updatedImages := []v1beta1.NodeImage{}
 	// Note: we have to range over the discovered images here, instead of converting to a baseIDMapping, to keep the ordering consistent
 	for i := range discoveredImages {

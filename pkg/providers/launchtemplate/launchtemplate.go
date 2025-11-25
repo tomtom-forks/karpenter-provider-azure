@@ -136,12 +136,9 @@ func (p *Provider) getStaticParameters(
 	labels map[string]string,
 ) (*parameters.StaticParameters, error) {
 	var arch string = karpv1.ArchitectureAmd64
-	log.FromContext(ctx).WithValues("arch", arch).Info("debuuug: instance type architecture check start")
 	if err := instanceType.Requirements.Compatible(scheduling.NewRequirements(scheduling.NewRequirement(v1.LabelArchStable, v1.NodeSelectorOpIn, karpv1.ArchitectureArm64))); err == nil {
 		arch = karpv1.ArchitectureArm64
-		log.FromContext(ctx).WithValues("error", err).Info("debuuug: instance type architecture error")
 	}
-	log.FromContext(ctx).WithValues("arch", arch).Info("debuuug: instance type architecture check finished")
 
 	subnetID := lo.Ternary(nodeClass.Spec.VNETSubnetID != nil, lo.FromPtr(nodeClass.Spec.VNETSubnetID), options.FromContext(ctx).SubnetID)
 

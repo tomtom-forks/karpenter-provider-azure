@@ -102,9 +102,9 @@ func (p *provider) List(ctx context.Context, nodeClass *v1beta1.AKSNodeClass) ([
 		return []NodeImage{}, err
 	}
 
-	if nodeImages, ok := p.nodeImagesCache.Get(key); ok {
-		return nodeImages.([]NodeImage), nil
-	}
+	//if nodeImages, ok := p.nodeImagesCache.Get(key); ok {
+	//	return nodeImages.([]NodeImage), nil
+	//}
 
 	var nodeImages []NodeImage
 	if *nodeClass.Spec.ImageFamily == "Custom" {
@@ -224,7 +224,7 @@ func (p *provider) listTTIG(ctx context.Context, nodeClass *v1beta1.AKSNodeClass
 	imageTerm := nodeClass.Spec.CustomImageTerm
 
 	key := BuildImageIDSIG(imageTerm.GallerySubscriptionID, imageTerm.GalleryResourceGroupName, imageTerm.GalleryName, imageTerm.Name, imageTerm.Version)
-	log.FromContext(ctx).WithValues("cache key", key).Info("debuuug: retrieved cache key for TTIG image")
+	log.FromContext(ctx).WithValues("cache key", key).Info("CustomImage: retrieved cache key for TTIG image")
 	if cachedImage, found := p.nodeImagesCache.Get(key); found {
 		return cachedImage.([]NodeImage), nil
 	}
@@ -243,12 +243,10 @@ func (p *provider) listTTIG(ctx context.Context, nodeClass *v1beta1.AKSNodeClass
 
 	if imageTerm.Version != "" {
 		imageInfo, err := clientFactory.NewGalleryImageVersionsClient().Get(ctx, imageTerm.GalleryResourceGroupName, imageTerm.GalleryName, imageTerm.Name, imageTerm.Version, nil)
-		log.FromContext(ctx).WithValues("imageInfo", imageInfo).Info("debuuug: retrieved image info")
 		if err != nil {
 			return nil, err
 		}
 		imageCandidate = imageInfo.GalleryImageVersion
-		log.FromContext(ctx).WithValues("imageCandidate", imageCandidate).Info("debuuug: retrieved imageCandidate")
 	} else {
 		pager := clientFactory.NewGalleryImageVersionsClient().NewListByGalleryImagePager(imageTerm.GalleryResourceGroupName, imageTerm.GalleryName, imageTerm.Name, nil)
 		for pager.More() {

@@ -32,7 +32,10 @@ import (
 )
 
 const (
-	PrivateGalleryURL = "UserDefined"
+	CustomUbuntu2204Gen2ImageDefinition      = "github-actions-runner"
+	CustomUbuntu2204CacheGen2ImageDefinition = "github-actions-runner-cache"
+	CustomUbuntu2204ARMGen2ImageDefinition   = "github-actions-runner-arm"
+	PrivateGalleryURL                        = "NOT-USED-PRIVATE-GALLERY"
 )
 
 type CustomImages struct {
@@ -53,14 +56,34 @@ func (u CustomImages) DefaultImages(useSIG bool, fipsMode *v1beta1.FIPSMode) []t
 		return []types.DefaultImageOutput{}
 	}
 	// image provider will select these images in order, first match wins. This is why we chose to put Ubuntu2404Gen2containerd first in the defaultImages
+
 	return []types.DefaultImageOutput{
 		{
 			PublicGalleryURL: PrivateGalleryURL,
+			ImageDefinition:  CustomUbuntu2204Gen2ImageDefinition,
 			Requirements: scheduling.NewRequirements(
 				scheduling.NewRequirement(v1.LabelArchStable, v1.NodeSelectorOpIn, karpv1.ArchitectureAmd64),
 				scheduling.NewRequirement(v1beta1.LabelSKUHyperVGeneration, v1.NodeSelectorOpIn, v1beta1.HyperVGenerationV2),
 			),
-			Distro: "aks-ubuntu-containerd-24.04-gen2",
+			Distro: "aks-ubuntu-containerd-22.04-gen2",
+		},
+		{
+			PublicGalleryURL: PrivateGalleryURL,
+			ImageDefinition:  CustomUbuntu2204CacheGen2ImageDefinition,
+			Requirements: scheduling.NewRequirements(
+				scheduling.NewRequirement(v1.LabelArchStable, v1.NodeSelectorOpIn, karpv1.ArchitectureAmd64),
+				scheduling.NewRequirement(v1beta1.LabelSKUHyperVGeneration, v1.NodeSelectorOpIn, v1beta1.HyperVGenerationV2),
+			),
+			Distro: "aks-ubuntu-cache-containerd-22.04-gen2",
+		},
+		{
+			PublicGalleryURL: PrivateGalleryURL,
+			ImageDefinition:  CustomUbuntu2204ARMGen2ImageDefinition,
+			Requirements: scheduling.NewRequirements(
+				scheduling.NewRequirement(v1.LabelArchStable, v1.NodeSelectorOpIn, karpv1.ArchitectureArm64),
+				scheduling.NewRequirement(v1beta1.LabelSKUHyperVGeneration, v1.NodeSelectorOpIn, v1beta1.HyperVGenerationV2),
+			),
+			Distro: "aks-ubuntu-arm64-containerd-22.04-gen2",
 		},
 	}
 }
