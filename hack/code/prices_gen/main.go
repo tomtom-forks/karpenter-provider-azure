@@ -29,6 +29,8 @@ import (
 	"sort"
 	"time"
 
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/cloud"
+	"github.com/Azure/karpenter-provider-azure/pkg/auth"
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/pricing"
 	"github.com/samber/lo"
 )
@@ -38,12 +40,14 @@ var regions = []string{
 	"australiacentral2",
 	"australiaeast",
 	"australiasoutheast",
+	"austriaeast",
 	"brazilsouth",
 	"brazilsoutheast",
 	"canadacentral",
 	"canadaeast",
 	"centralindia",
 	"centralus",
+	"chilecentral",
 	"eastasia",
 	"eastus",
 	"eastus2",
@@ -51,12 +55,18 @@ var regions = []string{
 	"francesouth",
 	"germanynorth",
 	"germanywestcentral",
+	"indonesiacentral",
+	"israelcentral",
+	"italynorth",
 	"japaneast",
 	"japanwest",
 	"jioindiacentral",
 	"jioindiawest",
 	"koreacentral",
 	"koreasouth",
+	"malaysiawest",
+	"mexicocentral",
+	"newzealandnorth",
 	"northcentralus",
 	"northeurope",
 	"norwayeast",
@@ -68,6 +78,7 @@ var regions = []string{
 	"southcentralus",
 	"southeastasia",
 	"southindia",
+	"spaincentral",
 	"swedencentral",
 	"swedensouth",
 	"switzerlandnorth",
@@ -113,13 +124,20 @@ func generatePricing(filePath string) {
 	fmt.Fprintf(src, "var initialPriceUpdate, _ = time.Parse(time.RFC3339, \"%s\")\n", now)
 	fmt.Fprintln(src, "var initialOnDemandPrices = map[string]map[string]float64{}")
 	fmt.Fprintln(src, "func init() {")
+
+	// Pin cloud to public for now
+	cloud := cloud.AzurePublic
+	env := &auth.Environment{
+		Cloud: cloud,
+	}
+
 	// record prices for each region
 	var pricingProviderByRegion = map[string]chan *pricing.Provider{}
 	for _, region := range regions {
 		resultsChan := make(chan *pricing.Provider)
 		log.Println("fetching pricing data in region", region)
 		go func(region string, resultsChan chan *pricing.Provider) {
-			pricingProvider := pricing.NewProvider(ctx, pricing.NewAPI(), region, make(chan struct{}))
+			pricingProvider := pricing.NewProvider(ctx, env, pricing.NewAPI(cloud), region, make(chan struct{}))
 			attempts := 0
 			for {
 				if pricingProvider.OnDemandLastUpdated().After(updateStarted) {
@@ -130,7 +148,7 @@ func generatePricing(filePath string) {
 					log.Println("started wait loop for pricing update on region", region)
 				} else if attempts%10 == 0 {
 					log.Printf("waiting on pricing update on region %s...\n", region)
-				} else if time.Now().Sub(updateStarted) >= time.Minute*2 {
+				} else if time.Since(updateStarted) >= time.Minute*2 {
 					log.Fatalf("failed to update region %s within 2 minutes", region)
 				}
 				time.Sleep(1 * time.Second)
@@ -143,7 +161,7 @@ func generatePricing(filePath string) {
 	}
 	for _, region := range regions {
 		pricingProviderChan := pricingProviderByRegion[region]
-		var pricingProvider *pricing.Provider = <-pricingProviderChan
+		var pricingProvider = <-pricingProviderChan
 		log.Println("writing output for", region)
 		instanceTypes := pricingProvider.InstanceTypes()
 		sort.Strings(instanceTypes)

@@ -17,11 +17,14 @@ limitations under the License.
 package imagefamily
 
 import (
-	"github.com/Azure/karpenter-provider-azure/pkg/apis/v1alpha2"
+	v1 "k8s.io/api/core/v1"
+
+	"github.com/Azure/karpenter-provider-azure/pkg/apis/v1beta1"
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/imagefamily/bootstrap"
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/imagefamily/customscriptsbootstrap"
+	types "github.com/Azure/karpenter-provider-azure/pkg/providers/imagefamily/types"
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/launchtemplate/parameters"
-	v1 "k8s.io/api/core/v1"
+	"github.com/samber/lo"
 
 	karpv1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
@@ -29,8 +32,10 @@ import (
 )
 
 const (
-	CustomImageImage  = "UserDefined"
-	PrivateGalleryURL = "UserDefined"
+	CustomUbuntu2204Gen2ImageDefinition      = "github-actions-runner"
+	CustomUbuntu2204CacheGen2ImageDefinition = "github-actions-runner-cache"
+	CustomUbuntu2204ARMGen2ImageDefinition   = "github-actions-runner-arm"
+	PrivateGalleryURL                        = "NOT-USED-PRIVATE-GALLERY"
 )
 
 type CustomImages struct {
@@ -38,25 +43,59 @@ type CustomImages struct {
 }
 
 func (u CustomImages) Name() string {
-	return v1alpha2.CustomImageFamily
+	return v1beta1.CustomImageFamily
 }
 
-func (u CustomImages) DefaultImages() []DefaultImageOutput {
-	// Have to implement same interface
-	return []DefaultImageOutput{
+func (u CustomImages) DefaultImages(useSIG bool, fipsMode *v1beta1.FIPSMode) []types.DefaultImageOutput {
+	if lo.FromPtr(fipsMode) == v1beta1.FIPSModeFIPS {
+		// Note: FIPS images aren't supported in public galleries, only shared image galleries
+		if !useSIG {
+			return []types.DefaultImageOutput{}
+		}
+		//TODO: Fill out when Ubuntu 24.04 with FIPS becomes available
+		return []types.DefaultImageOutput{}
+	}
+	// image provider will select these images in order, first match wins. This is why we chose to put Ubuntu2404Gen2containerd first in the defaultImages
+
+	return []types.DefaultImageOutput{
 		{
 			PublicGalleryURL: PrivateGalleryURL,
+			ImageDefinition:  CustomUbuntu2204Gen2ImageDefinition,
 			Requirements: scheduling.NewRequirements(
 				scheduling.NewRequirement(v1.LabelArchStable, v1.NodeSelectorOpIn, karpv1.ArchitectureAmd64),
-				scheduling.NewRequirement(v1alpha2.LabelSKUHyperVGeneration, v1.NodeSelectorOpIn, v1alpha2.HyperVGenerationV2),
+				scheduling.NewRequirement(v1beta1.LabelSKUHyperVGeneration, v1.NodeSelectorOpIn, v1beta1.HyperVGenerationV2),
 			),
-			Distro: "aks-ubuntu-containerd-22.04-gen2", // Will be overwritten by DistroName from CustomImageTerm
+			Distro: "aks-ubuntu-containerd-22.04-gen2",
+		},
+		{
+			PublicGalleryURL: PrivateGalleryURL,
+			ImageDefinition:  CustomUbuntu2204CacheGen2ImageDefinition,
+			Requirements: scheduling.NewRequirements(
+				scheduling.NewRequirement(v1.LabelArchStable, v1.NodeSelectorOpIn, karpv1.ArchitectureAmd64),
+				scheduling.NewRequirement(v1beta1.LabelSKUHyperVGeneration, v1.NodeSelectorOpIn, v1beta1.HyperVGenerationV2),
+			),
+			Distro: "aks-ubuntu-cache-containerd-22.04-gen2",
+		},
+		{
+			PublicGalleryURL: PrivateGalleryURL,
+			ImageDefinition:  CustomUbuntu2204ARMGen2ImageDefinition,
+			Requirements: scheduling.NewRequirements(
+				scheduling.NewRequirement(v1.LabelArchStable, v1.NodeSelectorOpIn, karpv1.ArchitectureArm64),
+				scheduling.NewRequirement(v1beta1.LabelSKUHyperVGeneration, v1.NodeSelectorOpIn, v1beta1.HyperVGenerationV2),
+			),
+			Distro: "aks-ubuntu-arm64-containerd-22.04-gen2",
 		},
 	}
 }
 
 // UserData returns the default userdata script for the image Family
-func (u CustomImages) ScriptlessCustomData(kubeletConfig *bootstrap.KubeletConfiguration, taints []v1.Taint, labels map[string]string, caBundle *string, _ *cloudprovider.InstanceType) bootstrap.Bootstrapper {
+func (u CustomImages) ScriptlessCustomData(
+	kubeletConfig *bootstrap.KubeletConfiguration,
+	taints []v1.Taint,
+	labels map[string]string,
+	caBundle *string,
+	_ *cloudprovider.InstanceType,
+) bootstrap.Bootstrapper {
 	return bootstrap.AKS{
 		Options: bootstrap.Options{
 			ClusterName:      u.Options.ClusterName,
@@ -67,6 +106,7 @@ func (u CustomImages) ScriptlessCustomData(kubeletConfig *bootstrap.KubeletConfi
 			CABundle:         caBundle,
 			GPUNode:          u.Options.GPUNode,
 			GPUDriverVersion: u.Options.GPUDriverVersion,
+			GPUDriverType:    u.Options.GPUDriverType,
 			GPUImageSHA:      u.Options.GPUImageSHA,
 			SubnetID:         u.Options.SubnetID,
 		},
@@ -86,7 +126,17 @@ func (u CustomImages) ScriptlessCustomData(kubeletConfig *bootstrap.KubeletConfi
 }
 
 // UserData returns the default userdata script for the image Family
-func (u CustomImages) CustomScriptsNodeBootstrapping(kubeletConfig *bootstrap.KubeletConfiguration, taints []v1.Taint, startupTaints []v1.Taint, labels map[string]string, instanceType *cloudprovider.InstanceType, imageDistro string, storageProfile string) customscriptsbootstrap.Bootstrapper {
+func (u CustomImages) CustomScriptsNodeBootstrapping(
+	kubeletConfig *bootstrap.KubeletConfiguration,
+	taints []v1.Taint,
+	startupTaints []v1.Taint,
+	labels map[string]string,
+	instanceType *cloudprovider.InstanceType,
+	imageDistro string,
+	storageProfile string,
+	nodeBootstrappingClient types.NodeBootstrappingAPI,
+	fipsMode *v1beta1.FIPSMode,
+) customscriptsbootstrap.Bootstrapper {
 	return customscriptsbootstrap.ProvisionClientBootstrap{
 		ClusterName:                    u.Options.ClusterName,
 		KubeletConfig:                  kubeletConfig,
@@ -103,5 +153,8 @@ func (u CustomImages) CustomScriptsNodeBootstrapping(kubeletConfig *bootstrap.Ku
 		InstanceType:                   instanceType,
 		StorageProfile:                 storageProfile,
 		ClusterResourceGroup:           u.Options.ClusterResourceGroup,
+		NodeBootstrappingProvider:      nodeBootstrappingClient,
+		OSSKU:                          customscriptsbootstrap.ImageFamilyOSSKUUbuntu2404,
+		FIPSMode:                       fipsMode,
 	}
 }

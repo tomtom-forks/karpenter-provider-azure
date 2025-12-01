@@ -24,10 +24,13 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Azure/karpenter-provider-azure/pkg/providers/pricing/client"
 	"github.com/samber/lo"
-	"knative.dev/pkg/logging"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/karpenter/pkg/utils/pretty"
+
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/cloud"
+	"github.com/Azure/karpenter-provider-azure/pkg/auth"
+	"github.com/Azure/karpenter-provider-azure/pkg/providers/pricing/client"
 )
 
 // pricingUpdatePeriod is how often we try to update our pricing information after the initial update on startup
@@ -51,6 +54,7 @@ type Provider struct {
 	onDemandPrices     map[string]float64
 	spotUpdateTime     time.Time
 	spotPrices         map[string]float64
+	done               chan struct{}
 }
 
 type Err struct {
@@ -60,11 +64,17 @@ type Err struct {
 }
 
 // NewPricingAPI returns a pricing API
-func NewAPI() client.PricingAPI {
-	return client.New()
+func NewAPI(cloud cloud.Configuration) client.PricingAPI {
+	return client.New(cloud)
 }
 
-func NewProvider(ctx context.Context, pricing client.PricingAPI, region string, startAsync <-chan struct{}) *Provider {
+func NewProvider(
+	ctx context.Context,
+	env *auth.Environment,
+	pricing client.PricingAPI,
+	region string,
+	startAsync <-chan struct{},
+) *Provider {
 	// see if we've got region specific pricing data
 	staticPricing, ok := initialOnDemandPrices[region]
 	if !ok {
@@ -81,35 +91,44 @@ func NewProvider(ctx context.Context, pricing client.PricingAPI, region string, 
 		spotPrices: staticPricing,
 		pricing:    pricing,
 		cm:         pretty.NewChangeMonitor(),
+		done:       make(chan struct{}),
 	}
-	ctx = logging.WithLogger(ctx, logging.FromContext(ctx).Named("pricing"))
+	ctx = log.IntoContext(ctx, log.FromContext(ctx).WithName("pricing").WithValues("region", region))
 
-	go func() {
-		// perform an initial price update at startup
-		p.updatePricing(ctx)
-
-		startup := time.Now()
-		// wait for leader election or to be signaled to exit
-		select {
-		case <-startAsync:
-		case <-ctx.Done():
-			return
-		}
-		// if it took many hours to be elected leader, we want to re-fetch pricing before we start our periodic
-		// polling
-		if time.Since(startup) > pricingUpdatePeriod {
+	// Only poll in public cloud. Other clouds aren't supported currently
+	if auth.IsPublic(env.Cloud) {
+		go func() {
+			log.FromContext(ctx).V(0).Info("starting pricing update loop")
+			// perform an initial price update at startup
 			p.updatePricing(ctx)
-		}
 
-		for {
+			startup := time.Now()
+			// wait for leader election or to be signaled to exit
 			select {
+			case <-startAsync:
 			case <-ctx.Done():
+				close(p.done)
 				return
-			case <-time.After(pricingUpdatePeriod):
+			}
+			// if it took many hours to be elected leader, we want to re-fetch pricing before we start our periodic
+			// polling
+			if time.Since(startup) > pricingUpdatePeriod {
 				p.updatePricing(ctx)
 			}
-		}
-	}()
+
+			for {
+				select {
+				case <-ctx.Done():
+					close(p.done)
+					return
+				case <-time.After(pricingUpdatePeriod):
+					p.updatePricing(ctx)
+				}
+			}
+		}()
+	} else {
+		close(p.done) // done immediately
+	}
 	return p
 }
 
@@ -141,6 +160,10 @@ func (p *Provider) OnDemandPrice(instanceType string) (float64, bool) {
 	defer p.mu.RUnlock()
 	price, ok := p.onDemandPrices[instanceType]
 	if !ok {
+		// if we don't have a price, check if it's a known SKU with missing price
+		if price, ok = skusWithMissingPrice[instanceType]; ok {
+			return price, true
+		}
 		return 0.0, false
 	}
 	return price, true
@@ -153,16 +176,30 @@ func (p *Provider) SpotPrice(instanceType string) (float64, bool) {
 	defer p.mu.RUnlock()
 	price, ok := p.spotPrices[instanceType]
 	if !ok {
+		// if we don't have a price, check if it's a known SKU with missing price
+		if price, ok = skusWithMissingPrice[instanceType]; ok {
+			return price, true
+		}
 		return 0.0, false
 	}
 	return price, true
 }
 
 func (p *Provider) updatePricing(ctx context.Context) {
+	if ctx.Err() != nil {
+		return
+	}
+
 	prices := map[client.Item]bool{}
 	err := p.fetchPricing(ctx, processPage(prices))
 	if err != nil {
-		logging.FromContext(ctx).Errorf("error fetching updated pricing for region %s, %s, using existing pricing data, on-demand: %s, spot: %s", p.region, err, err.lastOnDemandUpdateTime.Format(time.RFC3339), err.lastSpotUpdateTime.Format(time.RFC3339))
+		if ctx.Err() != nil {
+			return
+		}
+		log.FromContext(ctx).Error(err, "failed to fetch updated pricing, using existing pricing data",
+			"lastOnDemandUpdateTime", err.lastOnDemandUpdateTime.Format(time.RFC3339),
+			"lastSpotUpdateTime", err.lastSpotUpdateTime.Format(time.RFC3339),
+		)
 		return
 	}
 
@@ -173,7 +210,9 @@ func (p *Provider) updatePricing(ctx context.Context) {
 	go func() {
 		defer wg.Done()
 		if err := p.UpdateOnDemandPricing(ctx, onDemandPrices); err != nil {
-			logging.FromContext(ctx).Errorf("error updating on-demand pricing for region %s, %s, using existing pricing data from %s", p.region, err, err.lastOnDemandUpdateTime.Format(time.RFC3339))
+			log.FromContext(ctx).Error(err, "failed to update on-demand pricing, using existing pricing data",
+				"lastOnDemandUpdateTime", err.lastOnDemandUpdateTime.Format(time.RFC3339),
+			)
 		}
 	}()
 
@@ -181,7 +220,9 @@ func (p *Provider) updatePricing(ctx context.Context) {
 	go func() {
 		defer wg.Done()
 		if err := p.UpdateSpotPricing(ctx, spotPrices); err != nil {
-			logging.FromContext(ctx).Errorf("error updating spot pricing for region %s, %s, using existing pricing data from %s", p.region, err, err.lastSpotUpdateTime.Format(time.RFC3339))
+			log.FromContext(ctx).Error(err, "failed to update spot pricing, using existing pricing data",
+				"lastSpotUpdateTime", err.lastSpotUpdateTime.Format(time.RFC3339),
+			)
 		}
 	}()
 
@@ -198,7 +239,9 @@ func (p *Provider) UpdateOnDemandPricing(ctx context.Context, onDemandPrices map
 	p.onDemandPrices = lo.Assign(onDemandPrices)
 	p.onDemandUpdateTime = time.Now()
 	if p.cm.HasChanged("on-demand-prices", p.onDemandPrices) {
-		logging.FromContext(ctx).With("instance-type-count", len(p.onDemandPrices)).Infof("updated on-demand pricing for region %s", p.region)
+		log.FromContext(ctx).Info("updated on-demand pricing",
+			"instanceTypeCount", len(p.onDemandPrices),
+		)
 	}
 	return nil
 }
@@ -264,7 +307,9 @@ func (p *Provider) UpdateSpotPricing(ctx context.Context, spotPrices map[string]
 	p.spotPrices = lo.Assign(spotPrices)
 	p.spotUpdateTime = time.Now()
 	if p.cm.HasChanged("spot-prices", p.spotPrices) {
-		logging.FromContext(ctx).With("instance-type-count", len(p.spotPrices)).Infof("updated spot pricing for region %s", p.region)
+		log.FromContext(ctx).Info("updated spot pricing",
+			"instanceTypeCount", len(p.spotPrices),
+		)
 	}
 	return nil
 }
@@ -301,4 +346,18 @@ func (p *Provider) Reset() {
 	defer p.mu.Unlock()
 	p.onDemandPrices = staticPricing
 	p.onDemandUpdateTime = initialPriceUpdate
+}
+
+// WaitUntilDone should be called after canceling the context passed to NewProvider to wait until all goroutines have exited
+func (p *Provider) WaitUntilDone() error {
+	select {
+	case <-p.done:
+		return nil
+	case <-time.After(5 * time.Second):
+		return errors.New("timeout waiting for pricing provider to shut down")
+	}
+}
+
+func Regions() []string {
+	return lo.Keys(initialOnDemandPrices)
 }

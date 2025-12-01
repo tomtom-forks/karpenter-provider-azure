@@ -24,8 +24,16 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
+type FIPSMode string
+
+var (
+	FIPSModeFIPS     = FIPSMode("FIPS")
+	FIPSModeDisabled = FIPSMode("Disabled")
+)
+
 // AKSNodeClassSpec is the top level specification for the AKS Karpenter Provider.
 // This will contain configuration necessary to launch instances in AKS.
+// +kubebuilder:validation:XValidation:message="FIPS is not yet supported for Ubuntu2204 or Ubuntu2404",rule="has(self.fipsMode) && self.fipsMode == 'FIPS' ? (has(self.imageFamily) && self.imageFamily != 'Ubuntu2204' && self.imageFamily != 'Ubuntu2404') : true"
 type AKSNodeClassSpec struct {
 	// VNETSubnetID is the subnet used by nics provisioned with this nodeclass.
 	// If not specified, we will use the default --vnet-subnet-id specified in karpenter's options config
@@ -33,7 +41,8 @@ type AKSNodeClassSpec struct {
 	// +optional
 	VNETSubnetID *string `json:"vnetSubnetID,omitempty"`
 	// +kubebuilder:default=50
-	// +kubebuilder:validation:Minimum=50
+	// +kubebuilder:validation:Minimum=30
+	// +kubebuilder:validation:Maximum=2048
 	// osDiskSizeGB is the size of the OS disk in GB.
 	OSDiskSizeGB *int32 `json:"osDiskSizeGB,omitempty"`
 	// +kubebuilder:default=false
@@ -44,22 +53,40 @@ type AKSNodeClassSpec struct {
 	// +optional
 	CustomImageTerm CustomImageTerm `json:"customImageTerm,omitempty" hash:"ignore"`
 	// ImageFamily is the image family that instances use.
-	// +kubebuilder:default=Ubuntu2204
-	// +kubebuilder:validation:Enum:={Ubuntu2204,AzureLinux,Custom}
+	// +kubebuilder:default=Ubuntu
+	// +kubebuilder:validation:Enum:={Ubuntu,Ubuntu2204,Ubuntu2404,AzureLinux,Custom}
 	ImageFamily *string `json:"imageFamily,omitempty"`
-	// Tags to be applied on Azure resources like instances.
+	// FIPSMode controls FIPS compliance for the provisioned nodes
+	// +kubebuilder:validation:Enum:={FIPS,Disabled}
 	// +optional
-	Tags map[string]string `json:"tags,omitempty"`
+	FIPSMode *FIPSMode `json:"fipsMode,omitempty"`
+	// Tags to be applied on Azure resources like instances.
+	// +kubebuilder:validation:XValidation:message="tags keys must be less than 512 characters",rule="self.all(k, size(k) <= 512)"
+	// +kubebuilder:validation:XValidation:message="tags keys must not contain '<', '>', '%', '&', or '?'",rule="self.all(k, !k.matches('[<>%&?]'))"
+	// +kubebuilder:validation:XValidation:message="tags keys must not contain '\\'",rule="self.all(k, !k.contains('\\\\'))"
+	// +kubebuilder:validation:XValidation:message="tags values must be less than 256 characters",rule="self.all(k, size(self[k]) <= 256)"
+	// +optional
+	Tags map[string]string `json:"tags,omitempty" hash:"ignore"`
 	// Kubelet defines args to be used when configuring kubelet on provisioned nodes.
 	// They are a subset of the upstream types, recognizing not all options may be supported.
 	// Wherever possible, the types and names should reflect the upstream kubelet types.
 	// +kubebuilder:validation:XValidation:message="imageGCHighThresholdPercent must be greater than imageGCLowThresholdPercent",rule="has(self.imageGCHighThresholdPercent) && has(self.imageGCLowThresholdPercent) ?  self.imageGCHighThresholdPercent > self.imageGCLowThresholdPercent  : true"
 	// +optional
-	Kubelet *KubeletConfiguration `json:"kubelet,omitempty" hash:"ignore"`
+	Kubelet *KubeletConfiguration `json:"kubelet,omitempty"`
 	// MaxPods is an override for the maximum number of pods that can run on a worker node instance.
-	// +kubebuilder:validation:Minimum:=0
+	// See minimum + maximum pods per node documentation: https://learn.microsoft.com/en-us/azure/aks/concepts-network-ip-address-planning#maximum-pods-per-node
+	// Default behavior if this is not specified depends on the network plugin:
+	//   - If Network Plugin is Azure with "" (v1 or NodeSubnet), the default is 30.
+	//   - If Network Plugin is Azure with "overlay", the default is 250.
+	//   - If Network Plugin is None, the default is 250.
+	//   - Otherwise, the default is 110 (the usual Kubernetes default).
+	//
+	// +kubebuilder:validation:Minimum:=10
+	// +kubebuilder:validation:Maximum:=250
 	// +optional
 	MaxPods *int32 `json:"maxPods,omitempty"`
+	// Collection of security related karpenter fields
+	Security *Security `json:"security,omitempty"`
 }
 
 // CustomImageTerm defines selection logic for Custom Image used by Karpenter to launch nodes.
@@ -91,6 +118,16 @@ type CustomImageTerm struct {
 	// You can leave it empty and get latest image version
 	// +optional
 	Version string `json:"version,omitempty"`
+}
+
+// TODO: Add link for the aka.ms/nap/aksnodeclass-enable-host-encryption docs
+type Security struct {
+	// EncryptionAtHost specifies whether host-level encryption is enabled for provisioned nodes.
+	// For more information, see:
+	// https://learn.microsoft.com/en-us/azure/aks/enable-host-encryption
+	// https://learn.microsoft.com/en-us/azure/virtual-machines/disk-encryption#encryption-at-host---end-to-end-encryption-for-your-vm-data
+	// +optional
+	EncryptionAtHost *bool `json:"encryptionAtHost,omitempty"`
 }
 
 // KubeletConfiguration defines args to be used when configuring kubelet on provisioned nodes.
@@ -185,9 +222,12 @@ type KubeletConfiguration struct {
 
 // AKSNodeClass is the Schema for the AKSNodeClass API
 // +kubebuilder:object:root=true
-// +kubebuilder:resource:path=aksnodeclasses,scope=Cluster,categories=karpenter,shortName={aksnc,aksncs}
-// +kubebuilder:storageversion
+// +kubebuilder:resource:path=aksnodeclasses,scope=Cluster,categories={karpenter,nap},shortName={aksnc,aksncs}
+// +kubebuilder:printcolumn:name="Ready",type=string,JSONPath=".status.conditions[?(@.type=='Ready')].status"
+// +kubebuilder:printcolumn:name="Age",type=date,JSONPath=".metadata.creationTimestamp"
+// +kubebuilder:printcolumn:name="ImageFamily",type=string,JSONPath=".spec.imageFamily",priority=1
 // +kubebuilder:subresource:status
+// +kubebuilder:deprecatedversion:warning="use v1beta1.AKSNodeClass instead"
 type AKSNodeClass struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`
@@ -200,9 +240,8 @@ type AKSNodeClass struct {
 // 1. A field changes its default value for an existing field that is already hashed
 // 2. A field is added to the hash calculation with an already-set value
 // 3. A field is removed from the hash calculations
-const AKSNodeClassHashVersion = "v1"
+const AKSNodeClassHashVersion = "v3"
 
-// TODO: add hash tests
 func (in *AKSNodeClass) Hash() string {
 	return fmt.Sprint(lo.Must(hashstructure.Hash(in.Spec, hashstructure.FormatV2, &hashstructure.HashOptions{
 		SlicesAsSets:    true,
@@ -217,4 +256,13 @@ type AKSNodeClassList struct {
 	metav1.TypeMeta `json:",inline"`
 	metav1.ListMeta `json:"metadata,omitempty"`
 	Items           []AKSNodeClass `json:"items"`
+}
+
+// GetEncryptionAtHost returns whether encryption at host is enabled for the node class.
+// Returns false if Security or EncryptionAtHost is nil.
+func (in *AKSNodeClass) GetEncryptionAtHost() bool {
+	if in.Spec.Security != nil && in.Spec.Security.EncryptionAtHost != nil {
+		return *in.Spec.Security.EncryptionAtHost
+	}
+	return false
 }

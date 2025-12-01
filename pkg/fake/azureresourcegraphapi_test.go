@@ -21,9 +21,9 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/compute/armcompute/v5"
+	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/compute/armcompute/v7"
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/instance"
-	"github.com/Azure/karpenter-provider-azure/pkg/utils"
+	"github.com/Azure/karpenter-provider-azure/pkg/providers/launchtemplate"
 	"github.com/samber/lo"
 	"github.com/stretchr/testify/assert"
 )
@@ -42,7 +42,7 @@ func TestAzureResourceGraphAPI_Resources_VM(t *testing.T) {
 		{
 			testName:      "happy case",
 			vmNames:       []string{"A", "B", "C"},
-			tags:          map[string]*string{instance.NodePoolTagKey: lo.ToPtr("default")},
+			tags:          map[string]*string{launchtemplate.NodePoolTagKey: lo.ToPtr("default")},
 			expectedError: "",
 		},
 		{
@@ -61,7 +61,7 @@ func TestAzureResourceGraphAPI_Resources_VM(t *testing.T) {
 	for _, c := range cases {
 		t.Run(c.testName, func(t *testing.T) {
 			for _, name := range c.vmNames {
-				_, err := instance.CreateVirtualMachine(context.Background(), virtualMachinesAPI, resourceGroup, name, armcompute.VirtualMachine{Tags: c.tags})
+				_, err := instance.CreateVirtualMachine(context.Background(), virtualMachinesAPI, resourceGroup, name, armcompute.VirtualMachine{Tags: c.tags, Zones: []*string{lo.ToPtr("1")}})
 				if err != nil {
 					t.Errorf("Unexpected error %v", err)
 					return
@@ -88,6 +88,7 @@ func TestAzureResourceGraphAPI_Resources_VM(t *testing.T) {
 					}
 				}
 			}
+			virtualMachinesAPI.Reset()
 		})
 	}
 }
@@ -97,7 +98,7 @@ func checkVM(vm instance.Resource, rg string) error {
 	if !ok {
 		return fmt.Errorf("VM is missing name")
 	}
-	expectedID := utils.MkVMID(rg, name.(string))
+	expectedID := MkVMID(rg, name.(string))
 	id, ok := vm["id"]
 	if !ok {
 		return fmt.Errorf("VM is missing id")

@@ -17,7 +17,7 @@ limitations under the License.
 package parameters
 
 import (
-	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/compute/armcompute/v5"
+	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/compute/armcompute/v7"
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/imagefamily/bootstrap"
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/imagefamily/customscriptsbootstrap"
 )
@@ -46,7 +46,6 @@ type StaticParameters struct {
 	SubnetID                       string
 	ClusterResourceGroup           string
 
-	Tags   map[string]string
 	Labels map[string]string
 }
 
@@ -57,7 +56,8 @@ type Parameters struct {
 	CustomScriptsNodeBootstrapping customscriptsbootstrap.Bootstrapper
 	ImageID                        string
 	StorageProfileDiskType         string
+	StorageProfileIsEphemeral      bool
 	StorageProfilePlacement        armcompute.DiffDiskPlacement
-	StorageProfileSizeGB           float64
+	StorageProfileSizeGB           int32
 	IsWindows                      bool
 }

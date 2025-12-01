@@ -18,29 +18,47 @@ package imagefamily
 
 import (
 	"context"
-	"strconv"
+	"fmt"
 
 	corev1 "k8s.io/api/core/v1"
-	"knative.dev/pkg/logging"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 
-	"github.com/Azure/karpenter-provider-azure/pkg/apis/v1alpha2"
+	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/compute/armcompute/v7"
+	"github.com/Azure/karpenter-provider-azure/pkg/apis/v1beta1"
 	"github.com/Azure/karpenter-provider-azure/pkg/consts"
+	"github.com/Azure/karpenter-provider-azure/pkg/logging"
 	"github.com/Azure/karpenter-provider-azure/pkg/metrics"
+	"github.com/Azure/karpenter-provider-azure/pkg/operator/options"
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/imagefamily/bootstrap"
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/imagefamily/customscriptsbootstrap"
+	types "github.com/Azure/karpenter-provider-azure/pkg/providers/imagefamily/types"
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/instancetype"
 	template "github.com/Azure/karpenter-provider-azure/pkg/providers/launchtemplate/parameters"
 	"github.com/Azure/karpenter-provider-azure/pkg/utils"
 	"github.com/samber/lo"
 	karpv1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
+	"sigs.k8s.io/karpenter/pkg/scheduling"
 )
 
-// Resolver is able to fill-in dynamic launch template parameters
-type Resolver struct {
-	imageProvider        *Provider
-	instanceTypeProvider instancetype.Provider
+type Resolver interface {
+	Resolve(
+		ctx context.Context,
+		nodeClass *v1beta1.AKSNodeClass,
+		nodeClaim *karpv1.NodeClaim,
+		instanceType *cloudprovider.InstanceType,
+		staticParameters *template.StaticParameters) (*template.Parameters, error)
+}
+
+// assert that defaultResolver implements Resolver interface
+var _ Resolver = &defaultResolver{}
+
+// defaultResolver is able to fill-in dynamic launch template parameters
+type defaultResolver struct {
+	nodeBootstrappingProvider types.NodeBootstrappingAPI
+	imageProvider             *provider
+	instanceTypeProvider      instancetype.Provider
 }
 
 // ImageFamily can be implemented to override the default logic for generating dynamic launch template parameters
@@ -60,34 +78,70 @@ type ImageFamily interface {
 		instanceType *cloudprovider.InstanceType,
 		imageDistro string,
 		storageProfile string,
+		nodeBootstrappingClient types.NodeBootstrappingAPI,
+		fipsMode *v1beta1.FIPSMode,
 	) customscriptsbootstrap.Bootstrapper
 	Name() string
 	// DefaultImages returns a list of default CommunityImage definitions for this ImageFamily.
 	// Our Image Selection logic relies on the ordering of the default images to be ordered from most preferred to least, then we will select the latest image version available for that CommunityImage definition.
 	// Our Release pipeline ensures all images are released together within 24 hours of each other for community image gallery, so selecting based on image feature priorities, then by date, and not vice-versa is acceptable.
-	DefaultImages() []DefaultImageOutput
+	// If fipsMode is FIPSModeFIPS, only FIPS-enabled images will be returned
+	DefaultImages(useSIG bool, fipsMode *v1beta1.FIPSMode) []types.DefaultImageOutput
 }
 
-// New constructs a new launch template Resolver
-func New(_ client.Client, imageProvider *Provider, instanceTypeProvider instancetype.Provider) *Resolver {
-	return &Resolver{
-		imageProvider:        imageProvider,
-		instanceTypeProvider: instanceTypeProvider,
+// NewDefaultResolver constructs a new launch template Resolver
+func NewDefaultResolver(_ client.Client, imageProvider *provider, instanceTypeProvider instancetype.Provider, nodeBootstrappingClient types.NodeBootstrappingAPI) *defaultResolver {
+	return &defaultResolver{
+		imageProvider:             imageProvider,
+		nodeBootstrappingProvider: nodeBootstrappingClient,
+		instanceTypeProvider:      instanceTypeProvider,
 	}
 }
 
 // Resolve fills in dynamic launch template parameters
-func (r Resolver) Resolve(ctx context.Context, nodeClass *v1alpha2.AKSNodeClass, nodeClaim *karpv1.NodeClaim, instanceType *cloudprovider.InstanceType,
-	staticParameters *template.StaticParameters) (*template.Parameters, error) {
-	var imageID string
+func (r *defaultResolver) Resolve(
+	ctx context.Context,
+	nodeClass *v1beta1.AKSNodeClass,
+	nodeClaim *karpv1.NodeClaim,
+	instanceType *cloudprovider.InstanceType,
+	staticParameters *template.StaticParameters,
+) (*template.Parameters, error) {
+	nodeImages, err := nodeClass.GetImages()
+	if err != nil {
+		return nil, err
+	}
+	kubernetesVersion, err := nodeClass.GetKubernetesVersion()
+	if err != nil {
+		return nil, err
+	}
 
-	imageFamily := getImageFamily(nodeClass.Spec.ImageFamily, staticParameters)
-	imageDistro, imageID, err := r.imageProvider.Get(ctx, nodeClass, instanceType, imageFamily)
+	imageFamily := GetImageFamily(nodeClass.Spec.ImageFamily, nodeClass.Spec.FIPSMode, kubernetesVersion, staticParameters)
+	imageID, err := r.resolveNodeImage(nodeImages, instanceType)
 	if err != nil {
 		metrics.ImageSelectionErrorCount.WithLabelValues(imageFamily.Name()).Inc()
 		return nil, err
 	}
-	logging.FromContext(ctx).Infof("Resolved image %s for instance type %s", imageID, instanceType.Name)
+
+	log.FromContext(ctx).Info("resolved image",
+		logging.ImageID, imageID,
+		logging.InstanceType, instanceType.Name,
+	)
+
+	// TODO: as ProvisionModeBootstrappingClient path develops, we will eventually be able to drop the retrieval of imageDistro here.
+	useSIG := options.FromContext(ctx).UseSIG
+	imageDistro := ""
+	if *nodeClass.Spec.ImageFamily == "Custom" {
+		if nodeClass.Spec.CustomImageTerm.DistroName == "" {
+			return nil, fmt.Errorf("custom image family requires specifying .spec.customImageTerm.distroName")
+		}
+		imageDistro = nodeClass.Spec.CustomImageTerm.DistroName
+	} else {
+		imageDistro, err = mapToImageDistro(imageID, nodeClass.Spec.FIPSMode, imageFamily, useSIG)
+		if err != nil {
+			return nil, err
+		}
+
+	}
 
 	generalTaints := nodeClaim.Spec.Taints
 	startupTaints := nodeClaim.Spec.StartupTaints
@@ -104,61 +158,89 @@ func (r Resolver) Resolve(ctx context.Context, nodeClass *v1alpha2.AKSNodeClass,
 		allTaints = append(allTaints, karpv1.UnregisteredNoExecuteTaint)
 	}
 
-	diskType := "ManagedDisks"
-	if useEphemeralDisk(instanceType, nodeClass) {
-		diskType = "Ephemeral"
-	}
 	sku, err := r.instanceTypeProvider.Get(ctx, nodeClass, instanceType.Name)
 	if err != nil {
 		return nil, err
 	}
-	diskSize, placement := instancetype.GetEphemeralOSDiskSizeAndPlacement(ctx, sku)
+	diskType, placement, err := r.getStorageProfile(ctx, instanceType, nodeClass)
+	diskSize, _ := instancetype.FindMaxEphemeralSizeGBAndPlacement(sku)
+
+	if err != nil {
+		return nil, err
+	}
+	sku, err = r.instanceTypeProvider.Get(ctx, nodeClass, instanceType.Name)
+	if err != nil {
+		return nil, err
+	}
 
 	template := &template.Parameters{
 		StaticParameters: staticParameters,
 		ScriptlessCustomData: imageFamily.ScriptlessCustomData(
-			prepareKubeletConfiguration(instanceType, nodeClass),
+			prepareKubeletConfiguration(ctx, instanceType, nodeClass),
 			allTaints,
 			staticParameters.Labels,
 			staticParameters.CABundle,
 			instanceType,
 		),
 		CustomScriptsNodeBootstrapping: imageFamily.CustomScriptsNodeBootstrapping(
-			prepareKubeletConfiguration(instanceType, nodeClass),
+			prepareKubeletConfiguration(ctx, instanceType, nodeClass),
 			generalTaints,
 			startupTaints,
 			staticParameters.Labels,
 			instanceType,
 			imageDistro,
 			diskType,
+			r.nodeBootstrappingProvider,
+			nodeClass.Spec.FIPSMode,
 		),
-		ImageID:                 imageID,
-		StorageProfileDiskType:  diskType,
-		StorageProfilePlacement: placement,
+		StorageProfileDiskType:    diskType,
+		StorageProfileIsEphemeral: diskType == consts.StorageProfileEphemeral,
+		StorageProfilePlacement:   lo.FromPtr(placement),
 
 		// TODO: We could potentially use the instance type to do defaulting like
 		// traditional AKS, so putting this here along with the other settings
-		StorageProfileSizeGB: diskSize,
-
-		IsWindows: false, // TODO(Windows)
+		StorageProfileSizeGB: int32(diskSize),
+		ImageID:              imageID,
+		IsWindows:            false, // TODO(Windows)
 	}
 
 	return template, nil
 }
 
-func prepareKubeletConfiguration(instanceType *cloudprovider.InstanceType, nodeClass *v1alpha2.AKSNodeClass) *bootstrap.KubeletConfiguration {
+func (r *defaultResolver) getStorageProfile(ctx context.Context, instanceType *cloudprovider.InstanceType, nodeClass *v1beta1.AKSNodeClass) (diskType string, placement *armcompute.DiffDiskPlacement, err error) {
+	sku, err := r.instanceTypeProvider.Get(ctx, nodeClass, instanceType.Name)
+	if err != nil {
+		return "", nil, err
+	}
+
+	_, placement = instancetype.FindMaxEphemeralSizeGBAndPlacement(sku)
+
+	if instancetype.UseEphemeralDisk(sku, nodeClass) {
+		return consts.StorageProfileEphemeral, placement, nil
+	}
+	return consts.StorageProfileManagedDisks, placement, nil
+}
+
+func mapToImageDistro(imageID string, fipsMode *v1beta1.FIPSMode, imageFamily ImageFamily, useSIG bool) (string, error) {
+	var imageInfo types.DefaultImageOutput
+	imageInfo.PopulateImageTraitsFromID(imageID)
+	for _, defaultImage := range imageFamily.DefaultImages(useSIG, fipsMode) {
+		if defaultImage.ImageDefinition == imageInfo.ImageDefinition {
+			return defaultImage.Distro, nil
+		}
+	}
+	return "", fmt.Errorf("no distro found for image id %s", imageID)
+}
+
+func prepareKubeletConfiguration(ctx context.Context, instanceType *cloudprovider.InstanceType, nodeClass *v1beta1.AKSNodeClass) *bootstrap.KubeletConfiguration {
 	kubeletConfig := &bootstrap.KubeletConfiguration{}
 
 	if nodeClass.Spec.Kubelet != nil {
 		kubeletConfig.KubeletConfiguration = *nodeClass.Spec.Kubelet
 	}
 
-	// TODO: make default maxpods dependent on CNI
-	if nodeClass.Spec.MaxPods != nil {
-		kubeletConfig.MaxPods = *nodeClass.Spec.MaxPods
-	} else {
-		kubeletConfig.MaxPods = consts.DefaultKubernetesMaxPods
-	}
+	kubeletConfig.MaxPods = utils.GetMaxPods(nodeClass, options.FromContext(ctx).NetworkPlugin, options.FromContext(ctx).NetworkPluginMode)
+	kubeletConfig.ClusterDNSServiceIP = options.FromContext(ctx).DNSServiceIP
 
 	// TODO: revisit computeResources implementation
 	kubeletConfig.KubeReserved = utils.StringMap(instanceType.Overhead.KubeReserved)
@@ -167,34 +249,55 @@ func prepareKubeletConfiguration(instanceType *cloudprovider.InstanceType, nodeC
 	return kubeletConfig
 }
 
-func getImageFamily(familyName *string, parameters *template.StaticParameters) ImageFamily {
+func getSupportedImages(familyName *string, fipsMode *v1beta1.FIPSMode, kubernetesVersion string, useSIG bool) []types.DefaultImageOutput {
+	// TODO: Options aren't used within DefaultImages, so safe to be using nil here. Refactor so we don't actually need to pass in Options for getting DefaultImage.
+	imageFamily := GetImageFamily(familyName, fipsMode, kubernetesVersion, nil)
+	return imageFamily.DefaultImages(useSIG, fipsMode)
+}
+
+func GetImageFamily(familyName *string, fipsMode *v1beta1.FIPSMode, kubernetesVersion string, parameters *template.StaticParameters) ImageFamily {
 	switch lo.FromPtr(familyName) {
-	case v1alpha2.Ubuntu2204ImageFamily:
+	case v1beta1.Ubuntu2204ImageFamily:
 		return &Ubuntu2204{Options: parameters}
-	case v1alpha2.CustomImageFamily:
-		return &CustomImages{Options: parameters}
-	case v1alpha2.AzureLinuxImageFamily:
+	case v1beta1.Ubuntu2404ImageFamily:
+		return &Ubuntu2404{Options: parameters}
+	case v1beta1.AzureLinuxImageFamily:
+		if UseAzureLinux3(kubernetesVersion) {
+			return &AzureLinux3{Options: parameters}
+		}
 		return &AzureLinux{Options: parameters}
+	case v1beta1.CustomImageFamily:
+		return &CustomImages{Options: parameters}
+	case v1beta1.UbuntuImageFamily:
+		fallthrough
 	default:
-		return &Ubuntu2204{Options: parameters}
+		return defaultUbuntu(fipsMode, kubernetesVersion, parameters)
 	}
 }
 
-func getEphemeralMaxSizeGB(instanceType *cloudprovider.InstanceType) int32 {
-	reqs := instanceType.Requirements.Get(v1alpha2.LabelSKUStorageEphemeralOSMaxSize).Values()
-	if len(reqs) == 0 || len(reqs) > 1 {
-		return 0
+func defaultUbuntu(fipsMode *v1beta1.FIPSMode, kubernetesVersion string, parameters *template.StaticParameters) ImageFamily {
+	if lo.FromPtr(fipsMode) == v1beta1.FIPSModeFIPS {
+		return &Ubuntu2004{Options: parameters}
 	}
-	maxSize, err := strconv.ParseFloat(reqs[0], 32)
-	if err != nil {
-		return 0
+	if UseUbuntu2404(kubernetesVersion) {
+		return &Ubuntu2404{Options: parameters}
 	}
-	// decimal places are truncated, so we round down
-	return int32(maxSize)
+	return &Ubuntu2204{Options: parameters}
 }
 
-// setVMPropertiesStorageProfile enables ephemeral os disk for instance types that support it
-func useEphemeralDisk(instanceType *cloudprovider.InstanceType, nodeClass *v1alpha2.AKSNodeClass) bool {
-	// use ephemeral disk if it is large enough
-	return *nodeClass.Spec.OSDiskSizeGB <= getEphemeralMaxSizeGB(instanceType)
+// resolveNodeImage returns Distro and Image ID for the given instance type. Images may vary due to architecture, accelerator, etc
+//
+// Preconditions:
+// - nodeImages is sorted by priority order
+func (r *defaultResolver) resolveNodeImage(nodeImages []v1beta1.NodeImage, instanceType *cloudprovider.InstanceType) (string, error) {
+	// nodeImages are sorted by priority order, so we can return the first one that matches
+	for _, availableImage := range nodeImages {
+		if err := instanceType.Requirements.Compatible(
+			scheduling.NewNodeSelectorRequirements(availableImage.Requirements...),
+			v1beta1.AllowUndefinedWellKnownAndRestrictedLabels,
+		); err == nil {
+			return availableImage.ID, nil
+		}
+	}
+	return "", fmt.Errorf("no compatible images found for instance type %s", instanceType.Name)
 }

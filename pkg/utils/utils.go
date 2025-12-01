@@ -24,44 +24,47 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/compute/armcompute/v5"
+	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/compute/armcompute/v7"
+	"github.com/Azure/karpenter-provider-azure/pkg/apis/v1beta1"
+	"github.com/Azure/karpenter-provider-azure/pkg/consts"
+	"github.com/Azure/skewer"
+	"github.com/mitchellh/hashstructure/v2"
+
+	"github.com/samber/lo"
+
 	v1 "k8s.io/api/core/v1"
-	"knative.dev/pkg/logging"
 	"sigs.k8s.io/cloud-provider-azure/pkg/provider"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 )
 
-// GetVMName parses the provider ID stored on the node to get the vmName
-// associated with a node
-func GetVMName(providerID string) (string, error) {
-	// standalone VMs have providerID in the format: azure:///subscriptions/<subscriptionID>/resourceGroups/<resourceGroup>/providers/Microsoft.Compute/virtualMachines/<instanceID>
-	r := regexp.MustCompile(`azure:///subscriptions/.*/resourceGroups/.*/providers/Microsoft.Compute/virtualMachines/(?P<InstanceID>.*)`)
-	matches := r.FindStringSubmatch(providerID)
-	if matches == nil {
-		return "", fmt.Errorf("parsing vm name %s", providerID)
+// extractVersionFromVMSize extracts and normalizes the version from VMSizeType, dropping "v" prefix and backfilling "1"
+func ExtractVersionFromVMSize(vmsize *skewer.VMSizeType) string {
+	// safety-check to avoid panics, shouldn't happen in practice
+	if vmsize == nil {
+		return ""
 	}
-	for i, name := range r.SubexpNames() {
-		if name == "InstanceID" {
-			return matches[i], nil
+
+	version := "1"
+	if vmsize.Version != "" {
+		if !(vmsize.Version[0] == 'V' || vmsize.Version[0] == 'v') {
+			// should never happen; don't capture in label (won't be available for selection by version)
+			return ""
 		}
+		version = vmsize.Version[1:]
 	}
-	return "", fmt.Errorf("parsing vm name %s", providerID)
+	return version
 }
 
-func ResourceIDToProviderID(ctx context.Context, id string) string {
+func VMResourceIDToProviderID(ctx context.Context, id string) string {
 	providerID := fmt.Sprintf("azure://%s", id)
 	// for historical reasons Azure providerID has the resource group name in lower case
 	providerIDLowerRG, err := provider.ConvertResourceGroupNameToLower(providerID)
 	if err != nil {
-		logging.FromContext(ctx).Warnf("Failed to convert resource group name to lower case in providerID %s: %v", providerID, err)
+		log.FromContext(ctx).Info("failed to convert resource group name to lower case in providerID, using fallback", "providerID", providerID, "error", err)
 		// fallback to original providerID
 		return providerID
 	}
 	return providerIDLowerRG
-}
-
-func MkVMID(resourceGroupName string, vmName string) string {
-	const idFormat = "/subscriptions/subscriptionID/resourceGroups/%s/providers/Microsoft.Compute/virtualMachines/%s"
-	return fmt.Sprintf(idFormat, resourceGroupName, vmName)
 }
 
 // WithDefaultFloat64 returns the float64 value of the supplied environment variable or, if not present,
@@ -137,4 +140,54 @@ func PrettySlice[T any](s []T, maxItems int) string {
 		fmt.Fprint(&sb, elem)
 	}
 	return sb.String()
+}
+
+// GetMaxPods resolves what we should set max pods to for a given nodeclass.
+// If not specified, defaults based on network-plugin. 30 for "azure", 110 for "kubenet",
+// or 250 for "none" and network plugin mode overlay.
+func GetMaxPods(nodeClass *v1beta1.AKSNodeClass, networkPlugin, networkPluginMode string) int32 {
+	if nodeClass.Spec.MaxPods != nil {
+		return lo.FromPtr(nodeClass.Spec.MaxPods)
+	}
+	switch {
+	case networkPlugin == consts.NetworkPluginNone:
+		return consts.DefaultNetPluginNoneMaxPods
+	case networkPlugin == consts.NetworkPluginAzure && networkPluginMode == consts.NetworkPluginModeOverlay:
+		return consts.DefaultOverlayMaxPods
+	case networkPlugin == consts.NetworkPluginAzure && networkPluginMode == consts.NetworkPluginModeNone:
+		return consts.DefaultNodeSubnetMaxPods
+	default:
+		return consts.DefaultKubernetesMaxPods
+	}
+}
+
+var managedVNETPattern = regexp.MustCompile(`(?i)^aks-vnet-\d{8}$`)
+
+const managedSubnetName = "aks-subnet"
+
+// IsAKSManagedVNET determines if the vnet managed or not.
+// Note: You can "trick" this function if you really try by (for example) createding a VNET that looks like
+// an AKS managed VNET, with the same resource group as the MC RG, in a different subscription, or by creating
+// your own VNET in the MC RG whose name matches the AKS pattern but the VNET is actually yours rather than ours.
+func IsAKSManagedVNET(nodeResourceGroup string, subnetID string) (bool, error) {
+	// TODO: I kinda think we should be using arm.ParseResourceID rather than rolling our own
+	id, err := GetVnetSubnetIDComponents(subnetID)
+	if err != nil {
+		return false, err
+	}
+
+	return managedVNETPattern.MatchString(id.VNetName) &&
+		strings.EqualFold(nodeResourceGroup, id.ResourceGroupName) &&
+		strings.EqualFold(id.SubnetName, managedSubnetName), nil
+}
+
+// HasChanged returns if the given value has changed, given the existing and new instance
+//
+// This option is accessible in place of using a ChangeMonitor, when there's access to both
+// the existing and new data.
+func HasChanged(existing, new any, options *hashstructure.HashOptions) bool {
+	// In the case of errors, the zero value from hashing will be compared, similar to ChangeMonitor
+	existingHV, _ := hashstructure.Hash(existing, hashstructure.FormatV2, options)
+	newHV, _ := hashstructure.Hash(new, hashstructure.FormatV2, options)
+	return existingHV != newHV
 }

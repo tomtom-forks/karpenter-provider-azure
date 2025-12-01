@@ -18,16 +18,20 @@ package options
 
 import (
 	"fmt"
+	"net/netip"
 	"net/url"
+	"regexp"
+	"strings"
 
-	"github.com/Azure/karpenter-provider-azure/pkg/consts"
-	"github.com/Azure/karpenter-provider-azure/pkg/utils"
 	"github.com/go-playground/validator/v10"
 	"github.com/google/uuid"
 	"go.uber.org/multierr"
+
+	"github.com/Azure/karpenter-provider-azure/pkg/consts"
+	"github.com/Azure/karpenter-provider-azure/pkg/utils"
 )
 
-func (o Options) Validate() error {
+func (o *Options) Validate() error {
 	validate := validator.New()
 	return multierr.Combine(
 		o.validateRequiredFields(),
@@ -37,21 +41,32 @@ func (o Options) Validate() error {
 		o.validateVMMemoryOverheadPercent(),
 		o.validateVnetSubnetID(),
 		o.validateProvisionMode(),
+		o.validateUseSIG(),
+		o.validateAdminUsername(),
+		o.validateAdditionalTags(),
+		o.validateDiskEncryptionSetID(),
+		o.validateClusterDNSIP(),
 		validate.Struct(o),
 	)
 }
 
-func (o Options) validateVNETGUID() error {
-	if o.VnetGUID != "" && uuid.Validate(o.VnetGUID) != nil {
-		return fmt.Errorf("vnet-guid %s is malformed", o.VnetGUID)
-	}
-	if o.isAzureCNIWithOverlay() && o.VnetGUID == "" {
-		return fmt.Errorf("vnet-guid cannot be empty for AzureCNI clusters with networkPluginMode overlay")
+func (o *Options) validateClusterDNSIP() error {
+	if o.DNSServiceIP != "" {
+		if _, err := netip.ParseAddr(o.DNSServiceIP); err != nil {
+			return fmt.Errorf("dns-service-ip is invalid %w", err)
+		}
 	}
 	return nil
 }
 
-func (o Options) validateNetworkingOptions() error {
+func (o *Options) validateVNETGUID() error {
+	if o.VnetGUID != "" && uuid.Validate(o.VnetGUID) != nil {
+		return fmt.Errorf("vnet-guid %s is malformed", o.VnetGUID)
+	}
+	return nil
+}
+
+func (o *Options) validateNetworkingOptions() error {
 	if o.NetworkPlugin != consts.NetworkPluginAzure && o.NetworkPlugin != consts.NetworkPluginNone {
 		return fmt.Errorf("network-plugin %v is invalid. network-plugin must equal 'azure' or 'none'", o.NetworkPlugin)
 	}
@@ -68,11 +83,7 @@ func (o Options) validateNetworkingOptions() error {
 	return nil
 }
 
-func (o Options) isAzureCNIWithOverlay() bool {
-	return o.NetworkPlugin == consts.NetworkPluginAzure && o.NetworkPluginMode == consts.NetworkPluginModeOverlay
-}
-
-func (o Options) validateVnetSubnetID() error {
+func (o *Options) validateVnetSubnetID() error {
 	_, err := utils.GetVnetSubnetIDComponents(o.SubnetID)
 	if err != nil {
 		return fmt.Errorf("vnet-subnet-id is invalid: %w", err)
@@ -80,27 +91,24 @@ func (o Options) validateVnetSubnetID() error {
 	return nil
 }
 
-func (o Options) validateEndpoint() error {
+func (o *Options) validateEndpoint() error {
 	if o.ClusterEndpoint == "" {
 		return nil
 	}
-	endpoint, err := url.Parse(o.ClusterEndpoint)
-	// url.Parse() will accept a lot of input without error; make
-	// sure it's a real URL
-	if err != nil || !endpoint.IsAbs() || endpoint.Hostname() == "" {
+	if !isValidURL(o.ClusterEndpoint) {
 		return fmt.Errorf("\"%s\" not a valid clusterEndpoint URL", o.ClusterEndpoint)
 	}
 	return nil
 }
 
-func (o Options) validateVMMemoryOverheadPercent() error {
+func (o *Options) validateVMMemoryOverheadPercent() error {
 	if o.VMMemoryOverheadPercent < 0 {
 		return fmt.Errorf("vm-memory-overhead-percent cannot be negative")
 	}
 	return nil
 }
 
-func (o Options) validateProvisionMode() error {
+func (o *Options) validateProvisionMode() error {
 	if o.ProvisionMode != consts.ProvisionModeAKSScriptless && o.ProvisionMode != consts.ProvisionModeBootstrappingClient {
 		return fmt.Errorf("provision-mode is invalid: %s", o.ProvisionMode)
 	}
@@ -112,7 +120,7 @@ func (o Options) validateProvisionMode() error {
 	return nil
 }
 
-func (o Options) validateRequiredFields() error {
+func (o *Options) validateRequiredFields() error {
 	if o.ClusterEndpoint == "" {
 		return fmt.Errorf("missing field, cluster-endpoint")
 	}
@@ -127,6 +135,131 @@ func (o Options) validateRequiredFields() error {
 	}
 	if o.SubnetID == "" {
 		return fmt.Errorf("missing field, vnet-subnet-id")
+	}
+	if o.NodeResourceGroup == "" {
+		return fmt.Errorf("missing field, node-resource-group")
+	}
+	return nil
+}
+
+func (o *Options) validateUseSIG() error {
+	if o.UseSIG {
+		if o.SIGAccessTokenServerURL == "" {
+			return fmt.Errorf("sig-access-token-server-url is required when use-sig is true")
+		}
+		if o.SIGSubscriptionID == "" {
+			return fmt.Errorf("sig-subscription-id is required when use-sig is true")
+		}
+		if !isValidURL(o.SIGAccessTokenServerURL) {
+			return fmt.Errorf("sig-access-token-server-url is not a valid URL")
+		}
+	}
+	return nil
+}
+
+func (o *Options) validateAdminUsername() error {
+	if len(o.LinuxAdminUsername) > 32 {
+		return fmt.Errorf("linux-admin-username cannot be longer than 32 characters")
+	}
+
+	// Must start with a letter and only contain letters, numbers, hyphens, and underscores
+	match, err := regexp.MatchString("^[A-Za-z][-A-Za-z0-9_]*$", o.LinuxAdminUsername)
+	if err != nil {
+		return fmt.Errorf("error validating linux-admin-username: %w", err)
+	}
+	if !match {
+		return fmt.Errorf("linux-admin-username must start with a letter and only contain letters, numbers, hyphens, and underscores")
+	}
+
+	return nil
+}
+
+// validateAdditionalTags checks that additional tags are valid according to Azure's tag rules.
+// - Keys must be unique (case-insensitive)
+// - Keys must not exceed 512 characters
+// - Values must not exceed 256 characters
+// - Keys must not contain invalid characters: <, >, %, &, \, ?, /
+func (o *Options) validateAdditionalTags() error {
+	seen := make(map[string]struct{}, len(o.AdditionalTags))
+	for key, value := range o.AdditionalTags {
+		if len(key) > 512 {
+			return fmt.Errorf("additional-tags key %q exceeds maximum length of 512 characters", key)
+		}
+		if len(value) > 256 {
+			return fmt.Errorf("additional-tags value for key %q exceeds maximum length of 256 characters", key)
+		}
+		if strings.ContainsAny(key, `<>%&\?/`) {
+			return fmt.Errorf("additional-tags key %q contains invalid characters. <, >, %%, &, \\, ?, / are not allowed", key)
+		}
+		if _, exists := seen[strings.ToLower(key)]; exists {
+			return fmt.Errorf("additional-tags key %q is not unique (case-insensitive). Duplicate key found", key)
+		}
+		seen[strings.ToLower(key)] = struct{}{}
+	}
+
+	return nil
+}
+
+func isValidURL(u string) bool {
+	endpoint, err := url.Parse(u)
+	// url.Parse() will accept a lot of input without error; make
+	// sure it's a real URL
+	return err == nil && endpoint.IsAbs() && endpoint.Hostname() != ""
+}
+
+func (o *Options) validateDiskEncryptionSetID() error {
+	if o.DiskEncryptionSetID == "" {
+		return nil
+	}
+
+	parts, err := o.parseDiskEncryptionSetID()
+	if err != nil {
+		return err
+	}
+
+	if err := o.validateDiskEncryptionSetStructure(parts); err != nil {
+		return err
+	}
+
+	return o.validateDiskEncryptionSetValues(parts)
+}
+
+func (o *Options) parseDiskEncryptionSetID() ([]string, error) {
+	if !strings.HasPrefix(o.DiskEncryptionSetID, "/") {
+		return nil, fmt.Errorf("disk-encryption-set-id is invalid: must start with /subscriptions/, got %s", o.DiskEncryptionSetID)
+	}
+
+	parts := strings.Split(o.DiskEncryptionSetID, "/")
+	if len(parts) != 9 {
+		return nil, fmt.Errorf("disk-encryption-set-id is invalid: expected format /subscriptions/{subscriptionId}/resourceGroups/{resourceGroupName}/providers/Microsoft.Compute/diskEncryptionSets/{diskEncryptionSetName}, got %s", o.DiskEncryptionSetID)
+	}
+
+	return parts, nil
+}
+
+func (o *Options) validateDiskEncryptionSetStructure(parts []string) error {
+	if !strings.EqualFold(parts[1], "subscriptions") {
+		return fmt.Errorf("disk-encryption-set-id is invalid: must start with /subscriptions/, got %s", o.DiskEncryptionSetID)
+	}
+
+	if !strings.EqualFold(parts[3], "resourceGroups") {
+		return fmt.Errorf("disk-encryption-set-id is invalid: expected 'resourceGroups' at position 4, got %s", parts[3])
+	}
+
+	if !strings.EqualFold(parts[5], "providers") || !strings.EqualFold(parts[6], "Microsoft.Compute") {
+		return fmt.Errorf("disk-encryption-set-id is invalid: expected 'providers/Microsoft.Compute' at positions 6-7, got %s/%s", parts[5], parts[6])
+	}
+
+	if !strings.EqualFold(parts[7], "diskEncryptionSets") {
+		return fmt.Errorf("disk-encryption-set-id is invalid: expected 'diskEncryptionSets' at position 8, got %s", parts[7])
+	}
+
+	return nil
+}
+
+func (o *Options) validateDiskEncryptionSetValues(parts []string) error {
+	if parts[2] == "" || parts[4] == "" || parts[8] == "" {
+		return fmt.Errorf("disk-encryption-set-id is invalid: subscription ID, resource group name, and disk encryption set name must not be empty")
 	}
 	return nil
 }

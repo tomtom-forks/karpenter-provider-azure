@@ -4,7 +4,6 @@ include Makefile-az.mk
 LDFLAGS ?= -ldflags=-X=sigs.k8s.io/karpenter/pkg/operator.Version=$(shell git describe --tags --always | cut -d"v" -f2)
 
 GOFLAGS ?= $(LDFLAGS)
-WITH_GOFLAGS = GOFLAGS="$(GOFLAGS)"
 
 # # CR for local builds of Karpenter
 KARPENTER_NAMESPACE ?= kube-system
@@ -34,7 +33,10 @@ test: ## Run tests
 		--randomize-all \
 		./pkg/...
 
-deflake: ## Run randomized, racing tests until the test fails to catch flakes
+deflake: ## Run randomized, racing, code-covered tests to deflake failures
+	for i in $(shell seq 1 5); do make test || exit 1; done
+
+deflake-until-it-fails: ## Run randomized, racing tests until the test fails to catch flakes
 	ginkgo \
 		--race \
 		--focus="${FOCUS}" \
@@ -60,6 +62,20 @@ e2etests: ## Run the e2e suite against your local cluster
 		--ginkgo.grace-period=3m \
 		--ginkgo.vv
 
+upstream-e2etests:
+	AZURE_CLUSTER_NAME=${AZURE_CLUSTER_NAME} AZURE_ACR_NAME=${AZURE_ACR_NAME} AZURE_RESOURCE_GROUP=${AZURE_RESOURCE_GROUP} AZURE_SUBSCRIPTION_ID=${AZURE_SUBSCRIPTION_ID} AZURE_LOCATION=${AZURE_LOCATION} \
+	go test \
+		-count 1 \
+		-timeout 1h \
+		-v \
+		$(KARPENTER_CORE_DIR)/test/suites/$(shell echo $(TEST_SUITE) | tr A-Z a-z)/... \
+		--ginkgo.focus="${FOCUS}" \
+		--ginkgo.timeout=1h \
+		--ginkgo.grace-period=5m \
+		--ginkgo.vv \
+		--default-nodeclass="$(shell pwd)/test/pkg/environment/azure/default_aksnodeclass.yaml" \
+		--default-nodepool="$(shell pwd)/test/pkg/environment/azure/default_nodepool.yaml"
+
 benchmark:
 	go test -tags=test_performance -run=NoTests -bench=. ./...
 
@@ -72,14 +88,11 @@ verify: toolchain tidy download ## Verify code. Includes dependencies, linting, 
 	go generate ./...
 	hack/boilerplate.sh
 	cp $(KARPENTER_CORE_DIR)/pkg/apis/crds/* pkg/apis/crds
-	yq -i '(.spec.versions[0].additionalPrinterColumns[] | select (.name=="Zone")) .jsonPath=".metadata.labels.karpenter\.azure\.com/zone"' \
-		pkg/apis/crds/karpenter.sh_nodeclaims.yaml
 	hack/validation/kubelet.sh
 	hack/validation/labels.sh
 	hack/validation/requirements.sh
-	hack/validation/common.sh
+	hack/mutation/kubectl_get_ux.sh
 	cp pkg/apis/crds/* charts/karpenter-crd/templates
-	hack/mutation/conversion_webhooks_injection.sh
 	hack/github/dependabot.sh
 	$(foreach dir,$(MOD_DIRS),cd $(dir) && golangci-lint run $(newline))
 	@git diff --quiet ||\
@@ -94,6 +107,7 @@ verify: toolchain tidy download ## Verify code. Includes dependencies, linting, 
 
 vulncheck: ## Verify code vulnerabilities
 	@govulncheck ./pkg/...
+	@trivy filesystem --ignore-unfixed --scanners vuln --exit-code 1 go.mod
 
 licenses: download ## Verifies dependency licenses
 	! go-licenses csv ./... | grep -v -e 'MIT' -e 'Apache-2.0' -e 'BSD-3-Clause' -e 'BSD-2-Clause' -e 'ISC' -e 'MPL-2.0'
@@ -102,10 +116,10 @@ codegen: ## Auto generate files based on Azure API responses
 	./hack/codegen.sh
 
 snapshot: az-login ## Builds and publishes snapshot release
-	$(WITH_GOFLAGS) ./hack/release/snapshot.sh
+	./hack/release/snapshot.sh
 
 release: az-login ## Builds and publishes stable release
-	$(WITH_GOFLAGS) ./hack/release/release.sh
+	./hack/release/release.sh
 
 toolchain: ## Install developer toolchain
 	./hack/toolchain.sh
@@ -116,7 +130,7 @@ tidy: ## Recursively "go mod tidy" on all directories where go.mod exists
 download: ## Recursively "go mod download" on all directories where go.mod exists
 	$(foreach dir,$(MOD_DIRS),cd $(dir) && go mod download $(newline))
 
-.PHONY: help presubmit ci-test ci-non-test test deflake e2etests coverage verify vulncheck licenses codegen snapshot release toolchain tidy download
+.PHONY: help presubmit ci-test ci-non-test test deflake deflake-until-it-fails e2etests upstream-e2etests coverage verify vulncheck licenses codegen snapshot release toolchain tidy download
 
 define newline
 

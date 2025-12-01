@@ -25,35 +25,42 @@ import (
 	"strings"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/cloud"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
+	"github.com/Azure/karpenter-provider-azure/pkg/auth"
+	types "github.com/Azure/karpenter-provider-azure/pkg/providers/imagefamily/types"
 )
 
 type NodeImageVersionsClient struct {
-	cred azcore.TokenCredential
+	cred  azcore.TokenCredential
+	cloud cloud.Configuration
 }
 
-func NewNodeImageVersionsClient(cred azcore.TokenCredential) *NodeImageVersionsClient {
+func NewNodeImageVersionsClient(cred azcore.TokenCredential, cloud cloud.Configuration) *NodeImageVersionsClient {
 	return &NodeImageVersionsClient{
-		cred: cred,
+		cred:  cred,
+		cloud: cloud,
 	}
 }
 
-func (l *NodeImageVersionsClient) List(ctx context.Context, location, subscription string) (NodeImageVersionsResponse, error) {
+func (l *NodeImageVersionsClient) List(ctx context.Context, location, subscription string) (types.NodeImageVersionsResponse, error) {
+	resourceManagerConfig := l.cloud.Services[cloud.ResourceManager]
+
 	resourceURL := fmt.Sprintf(
-		"https://management.azure.com/subscriptions/%s/providers/Microsoft.ContainerService/locations/%s/nodeImageVersions?api-version=%s",
-		subscription, location, "2024-04-02-preview",
+		"%s/subscriptions/%s/providers/Microsoft.ContainerService/locations/%s/nodeImageVersions?api-version=%s",
+		resourceManagerConfig.Endpoint, subscription, location, "2024-04-02-preview",
 	)
 
 	token, err := l.cred.GetToken(ctx, policy.TokenRequestOptions{
-		Scopes: []string{"https://management.azure.com/.default"},
+		Scopes: []string{auth.TokenScope(l.cloud)},
 	})
 	if err != nil {
-		return NodeImageVersionsResponse{}, err
+		return types.NodeImageVersionsResponse{}, err
 	}
 
 	req, err := http.NewRequestWithContext(context.Background(), "GET", resourceURL, nil)
 	if err != nil {
-		return NodeImageVersionsResponse{}, err
+		return types.NodeImageVersionsResponse{}, err
 	}
 
 	req.Header.Set("Authorization", "Bearer "+token.Token)
@@ -62,15 +69,15 @@ func (l *NodeImageVersionsClient) List(ctx context.Context, location, subscripti
 	client := &http.Client{}
 	resp, err := client.Do(req)
 	if err != nil {
-		return NodeImageVersionsResponse{}, err
+		return types.NodeImageVersionsResponse{}, err
 	}
 	defer resp.Body.Close()
 
-	var response NodeImageVersionsResponse
+	var response types.NodeImageVersionsResponse
 	decoder := json.NewDecoder(resp.Body)
 	err = decoder.Decode(&response)
 	if err != nil {
-		return NodeImageVersionsResponse{}, err
+		return types.NodeImageVersionsResponse{}, err
 	}
 
 	response.Values = FilteredNodeImages(response.Values)
@@ -80,8 +87,8 @@ func (l *NodeImageVersionsClient) List(ctx context.Context, location, subscripti
 // FilteredNodeImages filters on two conditions
 // 1. The image is the latest version for the given OS and SKU
 // 2. the image belongs to a supported gallery(AKS Ubuntu or Azure Linux)
-func FilteredNodeImages(nodeImageVersions []NodeImageVersion) []NodeImageVersion {
-	latestImages := make(map[string]NodeImageVersion)
+func FilteredNodeImages(nodeImageVersions []types.NodeImageVersion) []types.NodeImageVersion {
+	latestImages := make(map[string]types.NodeImageVersion)
 
 	for _, image := range nodeImageVersions {
 		// Skip the galleries that Karpenter does not support
@@ -97,7 +104,7 @@ func FilteredNodeImages(nodeImageVersions []NodeImageVersion) []NodeImageVersion
 		}
 	}
 
-	var filteredImages []NodeImageVersion
+	var filteredImages []types.NodeImageVersion
 	for _, image := range latestImages {
 		filteredImages = append(filteredImages, image)
 	}

@@ -18,6 +18,7 @@ package options
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -27,11 +28,13 @@ import (
 	"os"
 	"strings"
 
-	"github.com/Azure/karpenter-provider-azure/pkg/consts"
-	"github.com/Azure/karpenter-provider-azure/pkg/utils"
 	"k8s.io/apimachinery/pkg/util/sets"
+	k8sflag "k8s.io/component-base/cli/flag"
 	coreoptions "sigs.k8s.io/karpenter/pkg/operator/options"
 	"sigs.k8s.io/karpenter/pkg/utils/env"
+
+	"github.com/Azure/karpenter-provider-azure/pkg/consts"
+	"github.com/Azure/karpenter-provider-azure/pkg/utils"
 )
 
 func init() {
@@ -60,29 +63,35 @@ func (s *nodeIdentitiesValue) String() string { return strings.Join(*s, ",") }
 type optionsKey struct{}
 
 type Options struct {
-	ClusterName                    string
-	ClusterEndpoint                string // => APIServerName in bootstrap, except needs to be w/o https/port
-	VMMemoryOverheadPercent        float64
-	ClusterID                      string
-	KubeletClientTLSBootstrapToken string // => TLSBootstrapToken in bootstrap (may need to be per node/nodepool)
-	SSHPublicKey                   string // ssh.publicKeys.keyData => VM SSH public key // TODO: move to v1alpha2.AKSNodeClass?
+	ClusterName                    string  `json:"clusterName,omitempty"`
+	ClusterEndpoint                string  `json:"clusterEndpoint,omitempty"` // => APIServerName in bootstrap, except needs to be w/o https/port
+	VMMemoryOverheadPercent        float64 `json:"vmMemoryOverheadPercent,omitempty"`
+	ClusterID                      string  `json:"clusterId,omitempty"`
+	KubeletClientTLSBootstrapToken string  `json:"-"` // => TLSBootstrapToken in bootstrap (may need to be per node/nodepool)
+	LinuxAdminUsername             string  `json:"-"`
+	SSHPublicKey                   string  `json:"-"` // ssh.publicKeys.keyData => VM SSH public key // TODO: move to v1beta1.AKSNodeClass?
 
-	NetworkPlugin     string // => NetworkPlugin in bootstrap
-	NetworkPolicy     string // => NetworkPolicy in bootstrap
-	NetworkPluginMode string // => Network Plugin Mode is used to control the mode the network plugin should operate in. For example, "overlay" used with --network-plugin=azure will use an overlay network (non-VNET IPs) for pods in the cluster. Learn more about overlay networking here: https://learn.microsoft.com/en-us/azure/aks/azure-cni-overlay?tabs=kubectl#overview-of-overlay-networking
-	NetworkDataplane  string
+	NetworkPlugin     string `json:"networkPlugin,omitempty"`     // => NetworkPlugin in bootstrap
+	NetworkPolicy     string `json:"networkPolicy,omitempty"`     // => NetworkPolicy in bootstrap
+	NetworkPluginMode string `json:"networkPluginMode,omitempty"` // => Network Plugin Mode is used to control the mode the network plugin should operate in. For example, "overlay" used with --network-plugin=azure will use an overlay network (non-VNET IPs) for pods in the cluster. Learn more about overlay networking here: https://learn.microsoft.com/en-us/azure/aks/azure-cni-overlay?tabs=kubectl#overview-of-overlay-networking
+	NetworkDataplane  string `json:"networkDataplane,omitempty"`
+	DNSServiceIP      string `json:"dnsServiceIP,omitempty"`
 
-	NodeIdentities []string // => Applied onto each VM
-	VnetGUID       string   // resource guid used by azure cni for identifying the right vnet
-	SubnetID       string   // => VnetSubnetID to use (for nodes in Azure CNI Overlay and Azure CNI + pod subnet; for for nodes and pods in Azure CNI), unless overridden via AKSNodeClass
-	setFlags       map[string]bool
+	NodeIdentities          []string `json:"nodeIdentities,omitempty"`          // => Applied onto each VM
+	KubeletIdentityClientID string   `json:"kubeletIdentityClientID,omitempty"` // => Flows to bootstrap and used in drift
+	VnetGUID                string   `json:"vnetGuid,omitempty"`                // resource guid used by azure cni for identifying the right vnet
+	SubnetID                string   `json:"subnetId,omitempty"`                // => VnetSubnetID to use (for nodes in Azure CNI Overlay and Azure CNI + pod subnet; for for nodes and pods in Azure CNI), unless overridden via AKSNodeClass
+	setFlags                map[string]bool
 
-	ProvisionMode              string
-	NodeBootstrappingServerURL string
-	UseSIG                     bool // => UseSIG is true if Karpenter is managed by AKS, false if it is a self-hosted karpenter installation
-
-	SIGSubscriptionID string
-	NodeResourceGroup string
+	ProvisionMode              string            `json:"provisionMode,omitempty"`
+	NodeBootstrappingServerURL string            `json:"-"`
+	UseSIG                     bool              `json:"useSIG,omitempty"` // => UseSIG is true if Karpenter is managed by AKS, false if it is a self-hosted karpenter installation
+	SIGAccessTokenServerURL    string            `json:"-"`                // => SIGAccessTokenServerURL used to access SIG, not set if it is a self-hosted karpenter installation
+	SIGSubscriptionID          string            `json:"sigSubscriptionId,omitempty"`
+	NodeResourceGroup          string            `json:"nodeResourceGroup,omitempty"`
+	AdditionalTags             map[string]string `json:"additionalTags,omitempty"`
+	EnableAzureSDKLogging      bool              `json:"enableAzureSDKLogging,omitempty"` // Controls whether Azure SDK middleware logging is enabled
+	DiskEncryptionSetID        string            `json:"diskEncryptionSetId,omitempty"`
 }
 
 func (o *Options) AddFlags(fs *coreoptions.FlagSet) {
@@ -90,22 +99,35 @@ func (o *Options) AddFlags(fs *coreoptions.FlagSet) {
 	fs.StringVar(&o.ClusterEndpoint, "cluster-endpoint", env.WithDefaultString("CLUSTER_ENDPOINT", ""), "[REQUIRED] The external kubernetes cluster endpoint for new nodes to connect with.")
 	fs.Float64Var(&o.VMMemoryOverheadPercent, "vm-memory-overhead-percent", utils.WithDefaultFloat64("VM_MEMORY_OVERHEAD_PERCENT", 0.075), "The VM memory overhead as a percent that will be subtracted from the total memory for all instance types.")
 	fs.StringVar(&o.KubeletClientTLSBootstrapToken, "kubelet-bootstrap-token", env.WithDefaultString("KUBELET_BOOTSTRAP_TOKEN", ""), "[REQUIRED] The bootstrap token for new nodes to join the cluster.")
+	fs.StringVar(&o.LinuxAdminUsername, "linux-admin-username", env.WithDefaultString("LINUX_ADMIN_USERNAME", "azureuser"), "The admin username for Linux VMs.")
 	fs.StringVar(&o.SSHPublicKey, "ssh-public-key", env.WithDefaultString("SSH_PUBLIC_KEY", ""), "[REQUIRED] VM SSH public key.")
 	fs.StringVar(&o.NetworkPlugin, "network-plugin", env.WithDefaultString("NETWORK_PLUGIN", consts.NetworkPluginAzure), "The network plugin used by the cluster.")
+	fs.StringVar(&o.DNSServiceIP, "dns-service-ip", env.WithDefaultString("DNS_SERVICE_IP", ""), "The IP address of cluster DNS service.")
 	fs.StringVar(&o.NetworkPluginMode, "network-plugin-mode", env.WithDefaultString("NETWORK_PLUGIN_MODE", consts.NetworkPluginModeOverlay), "network plugin mode of the cluster.")
 	fs.StringVar(&o.NetworkPolicy, "network-policy", env.WithDefaultString("NETWORK_POLICY", ""), "The network policy used by the cluster.")
 	fs.StringVar(&o.NetworkDataplane, "network-dataplane", env.WithDefaultString("NETWORK_DATAPLANE", "cilium"), "The network dataplane used by the cluster.")
-	fs.StringVar(&o.VnetGUID, "vnet-guid", env.WithDefaultString("VNET_GUID", ""), "The vnet guid of the clusters vnet, only required by azure cni with overlay")
-	fs.StringVar(&o.SubnetID, "vnet-subnet-id", env.WithDefaultString("VNET_SUBNET_ID", ""), "The default subnet ID to use for new nodes. This must be a valid ARM resource ID for subnet that does not overlap with the service CIDR or the pod CIDR.")
+	fs.StringVar(&o.VnetGUID, "vnet-guid", env.WithDefaultString("VNET_GUID", ""), "The vnet guid of the clusters vnet, only required by azure cni with overlay + byo vnet")
+	fs.StringVar(&o.SubnetID, "vnet-subnet-id", env.WithDefaultString("VNET_SUBNET_ID", ""), "[REQUIRED] The default subnet ID to use for new nodes. This must be a valid ARM resource ID for subnet that does not overlap with the service CIDR or the pod CIDR.")
 	fs.Var(newNodeIdentitiesValue(env.WithDefaultString("NODE_IDENTITIES", ""), &o.NodeIdentities), "node-identities", "User assigned identities for nodes.")
 	fs.StringVar(&o.ProvisionMode, "provision-mode", env.WithDefaultString("PROVISION_MODE", consts.ProvisionModeAKSScriptless), "[UNSUPPORTED] The provision mode for the cluster.")
 	fs.StringVar(&o.NodeBootstrappingServerURL, "nodebootstrapping-server-url", env.WithDefaultString("NODEBOOTSTRAPPING_SERVER_URL", ""), "[UNSUPPORTED] The url for the node bootstrapping provider server.")
 	fs.StringVar(&o.NodeResourceGroup, "node-resource-group", env.WithDefaultString("AZURE_NODE_RESOURCE_GROUP", ""), "[REQUIRED] the resource group created and managed by AKS where the nodes live")
+	fs.StringVar(&o.KubeletIdentityClientID, "kubelet-identity-client-id", env.WithDefaultString("KUBELET_IDENTITY_CLIENT_ID", ""), "The client ID of the kubelet identity.")
 	fs.BoolVar(&o.UseSIG, "use-sig", env.WithDefaultBool("USE_SIG", false), "If set to true karpenter will use the AKS managed shared image galleries and the node image versions api. If set to false karpenter will use community image galleries. Only a subset of image features will be available in the community image galleries and this flag is only for the managed node provisioning addon.")
+	fs.StringVar(&o.SIGAccessTokenServerURL, "sig-access-token-server-url", env.WithDefaultString("SIG_ACCESS_TOKEN_SERVER_URL", ""), "The URL for the SIG access token server. Only used for AKS managed karpenter. UseSIG must be set tot true for this to take effect.")
 	fs.StringVar(&o.SIGSubscriptionID, "sig-subscription-id", env.WithDefaultString("SIG_SUBSCRIPTION_ID", ""), "The subscription ID of the shared image gallery.")
+	fs.StringVar(&o.DiskEncryptionSetID, "node-osdisk-diskencryptionset-id", env.WithDefaultString("NODE_OSDISK_DISKENCRYPTIONSET_ID", ""), "The ARM resource ID of the disk encryption set to use for customer-managed key (BYOK) encryption.")
+
+	additionalTagsFlag := k8sflag.NewMapStringString(&o.AdditionalTags)
+	if err := additionalTagsFlag.Set(env.WithDefaultString("ADDITIONAL_TAGS", "")); err != nil {
+		panic(fmt.Sprintf("failed to parse ADDITIONAL_TAGS from string %q: %s", env.WithDefaultString("ADDITIONAL_TAGS", ""), err))
+	}
+	// See https://github.com/Azure/karpenter-provider-azure/issues/1042 for issue discussing improvements around this
+	fs.Var(additionalTagsFlag, "additional-tags", "Additional tags to apply to the resources in Azure. Format is key1=value1,key2=value2. These tags will be merged with the tags specified on the NodePool. In the case of a tag collision, the NodePool tag wins. These tags only apply to new nodes and do not trigger drift, which means that adding tags to this collection will not update existing nodes until drift triggers for some other reason.")
+	fs.BoolVar(&o.EnableAzureSDKLogging, "enable-azure-sdk-logging", env.WithDefaultBool("ENABLE_AZURE_SDK_LOGGING", true), "If set to false then Azure SDK middleware logging is disabled for debugging, and won't be logging all HTTP requests/responses to Azure APIs.")
 }
 
-func (o Options) GetAPIServerName() string {
+func (o *Options) GetAPIServerName() string {
 	endpoint, _ := url.Parse(o.ClusterEndpoint) // assume to already validated
 	return endpoint.Hostname()
 }
@@ -139,6 +161,15 @@ func (o *Options) Parse(fs *coreoptions.FlagSet, args ...string) error {
 	o.ClusterID = getAKSClusterID(o.GetAPIServerName())
 
 	return nil
+}
+
+func (o *Options) String() string {
+	json, err := json.Marshal(o)
+	if err != nil {
+		return "couldn't marshal options JSON"
+	}
+
+	return string(json)
 }
 
 func (o *Options) ToContext(ctx context.Context) context.Context {

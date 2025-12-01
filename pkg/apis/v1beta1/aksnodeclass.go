@@ -1,0 +1,269 @@
+/*
+Portions Copyright (c) Microsoft Corporation.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package v1beta1
+
+import (
+	"fmt"
+
+	"github.com/mitchellh/hashstructure/v2"
+	"github.com/samber/lo"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+)
+
+type FIPSMode string
+
+var (
+	FIPSModeFIPS     = FIPSMode("FIPS")
+	FIPSModeDisabled = FIPSMode("Disabled")
+)
+
+// AKSNodeClassSpec is the top level specification for the AKS Karpenter Provider.
+// This will contain configuration necessary to launch instances in AKS.
+// +kubebuilder:validation:XValidation:message="FIPS is not yet supported for Ubuntu2204 or Ubuntu2404",rule="has(self.fipsMode) && self.fipsMode == 'FIPS' ? (has(self.imageFamily) && self.imageFamily != 'Ubuntu2204' && self.imageFamily != 'Ubuntu2404') : true"
+type AKSNodeClassSpec struct {
+	// VNETSubnetID is the subnet used by nics provisioned with this nodeclass.
+	// If not specified, we will use the default --vnet-subnet-id specified in karpenter's options config
+	// +kubebuilder:validation:Pattern=`(?i)^\/subscriptions\/[^\/]+\/resourceGroups\/[a-zA-Z0-9_\-().]{0,89}[a-zA-Z0-9_\-()]\/providers\/Microsoft\.Network\/virtualNetworks\/[^\/]+\/subnets\/[^\/]+$`
+	// +optional
+	VNETSubnetID *string `json:"vnetSubnetID,omitempty"`
+	// +kubebuilder:default=50
+	// +kubebuilder:validation:Minimum=30
+	// +kubebuilder:validation:Maximum=2048
+	// osDiskSizeGB is the size of the OS disk in GB.
+	OSDiskSizeGB *int32 `json:"osDiskSizeGB,omitempty"`
+	// +kubebuilder:default=false
+	// +kubebuilder:validation:Optional
+	// OSDiskSizeDynamic is enable dynamic os disk size based on SKU max allowed disk
+	OSDiskSizeDynamic bool `json:"OSDiskSizeDynamic,omitempty"`
+	// CustomImageTerm is for user defined Azure Custom Images
+	// +optional
+	CustomImageTerm CustomImageTerm `json:"customImageTerm,omitempty" hash:"ignore"`
+	// ImageFamily is the image family that instances use.
+	// +kubebuilder:default=Ubuntu
+	// +kubebuilder:validation:Enum:={Ubuntu,Ubuntu2204,Ubuntu2404,AzureLinux,Custom}
+	ImageFamily *string `json:"imageFamily,omitempty"`
+	// FIPSMode controls FIPS compliance for the provisioned nodes
+	// +kubebuilder:validation:Enum:={FIPS,Disabled}
+	// +optional
+	FIPSMode *FIPSMode `json:"fipsMode,omitempty"`
+	// Tags to be applied on Azure resources like instances.
+	// +kubebuilder:validation:XValidation:message="tags keys must be less than 512 characters",rule="self.all(k, size(k) <= 512)"
+	// +kubebuilder:validation:XValidation:message="tags keys must not contain '<', '>', '%', '&', or '?'",rule="self.all(k, !k.matches('[<>%&?]'))"
+	// +kubebuilder:validation:XValidation:message="tags keys must not contain '\\'",rule="self.all(k, !k.contains('\\\\'))"
+	// +kubebuilder:validation:XValidation:message="tags values must be less than 256 characters",rule="self.all(k, size(self[k]) <= 256)"
+	// +optional
+	Tags map[string]string `json:"tags,omitempty" hash:"ignore"`
+	// Kubelet defines args to be used when configuring kubelet on provisioned nodes.
+	// They are a subset of the upstream types, recognizing not all options may be supported.
+	// Wherever possible, the types and names should reflect the upstream kubelet types.
+	// +kubebuilder:validation:XValidation:message="imageGCHighThresholdPercent must be greater than imageGCLowThresholdPercent",rule="has(self.imageGCHighThresholdPercent) && has(self.imageGCLowThresholdPercent) ?  self.imageGCHighThresholdPercent > self.imageGCLowThresholdPercent  : true"
+	// +optional
+	Kubelet *KubeletConfiguration `json:"kubelet,omitempty"`
+	// MaxPods is an override for the maximum number of pods that can run on a worker node instance.
+	// See minimum + maximum pods per node documentation: https://learn.microsoft.com/en-us/azure/aks/concepts-network-ip-address-planning#maximum-pods-per-node
+	// Default behavior if this is not specified depends on the network plugin:
+	//   - If Network Plugin is Azure with "" (v1 or NodeSubnet), the default is 30.
+	//   - If Network Plugin is Azure with "overlay", the default is 250.
+	//   - If Network Plugin is None, the default is 250.
+	//   - Otherwise, the default is 110 (the usual Kubernetes default).
+	//
+	// +kubebuilder:validation:Minimum:=10
+	// +kubebuilder:validation:Maximum:=250
+	// +optional
+	MaxPods *int32 `json:"maxPods,omitempty"`
+
+	// Collection of security related karpenter fields
+	Security *Security `json:"security,omitempty"`
+}
+
+// CustomImageTerm defines selection logic for Custom Image used by Karpenter to launch nodes.
+// If multiple fields are used for selection, the requirements are ANDed.
+type CustomImageTerm struct {
+	// GallerySubscriptionID is Image Gallery Subscription ID.
+	// +kubebuilder:validation:Pattern="^\\w{8}-\\w{4}-\\w{4}-\\w{4}-\\w{12}$"
+	// +optional
+	GallerySubscriptionID string `json:"gallerySubscriptionID,omitempty"`
+	// GalleryResourceGroupName is Image Gallery Resource Group Name.
+	// This value is the name field, which is different from the name tag.
+	// +optional
+	GalleryResourceGroupName string `json:"galleryResourceGroupName,omitempty"`
+	// GalleryName is Image Gallery Name.
+	// This value is the name field, which is different from the name tag.
+	// +optional
+	GalleryName string `json:"galleryName,omitempty"`
+	// Name is the Image name in Azure Image Gallery.
+	// This value is the name field, which is different from the name tag.
+	// +optional
+	Name string `json:"name,omitempty"`
+	// DistroName is the aks container service agent pool distro name which need to be valid.
+	// Here are all distro https://github.com/Azure/AgentBaker/blob/dev/pkg/agent/datamodel/types.go#L144.
+	// +kubebuilder:validation:Enum=aks-ubuntu-containerd-22.04-gen2;aks-ubuntu-arm64-containerd-22.04-gen2
+	// +kubebuilder:default="aks-ubuntu-containerd-22.04-gen2"
+	// +optional
+	DistroName string `json:"distroName,omitempty"`
+	// Version is Image version.
+	// You can leave it empty and get latest image version
+	// +optional
+	Version string `json:"version,omitempty"`
+}
+
+// TODO: Add link for the aka.ms/nap/aksnodeclass-enable-host-encryption docs
+type Security struct {
+	// EncryptionAtHost specifies whether host-level encryption is enabled for provisioned nodes.
+	// For more information, see:
+	// https://learn.microsoft.com/en-us/azure/aks/enable-host-encryption
+	// https://learn.microsoft.com/en-us/azure/virtual-machines/disk-encryption#encryption-at-host---end-to-end-encryption-for-your-vm-data
+	// +optional
+	EncryptionAtHost *bool `json:"encryptionAtHost,omitempty"`
+}
+
+// KubeletConfiguration defines args to be used when configuring kubelet on provisioned nodes.
+// They are a subset of the upstream types, recognizing not all options may be supported.
+// Wherever possible, the types and names should reflect the upstream kubelet types.
+// https://pkg.go.dev/k8s.io/kubelet/config/v1beta1#KubeletConfiguration
+// https://github.com/kubernetes/kubernetes/blob/9f82d81e55cafdedab619ea25cabf5d42736dacf/cmd/kubelet/app/options/options.go#L53
+//
+// AKS CustomKubeletConfig w/o CPUReserved,MemoryReserved,SeccompDefault
+// https://learn.microsoft.com/en-us/azure/aks/custom-node-configuration?tabs=linux-node-pools
+type KubeletConfiguration struct {
+	// clusterDNS is an IP addresses for the cluster DNS server.
+	// Note that not all providers may use all addresses.
+	//+optional
+	ClusterDNS string `json:"clusterDNS,omitempty"`
+	// cpuManagerPolicy is the name of the policy to use.
+	// +kubebuilder:validation:Enum:={none,static}
+	// +kubebuilder:default="none"
+	// +optional
+	CPUManagerPolicy string `json:"cpuManagerPolicy,omitempty"`
+	// CPUCFSQuota enables CPU CFS quota enforcement for containers that specify CPU limits.
+	// Note: AKS CustomKubeletConfig uses cpuCfsQuota (camelCase)
+	// +kubebuilder:default=true
+	// +optional
+	CPUCFSQuota *bool `json:"cpuCFSQuota,omitempty"`
+	// cpuCfsQuotaPeriod sets the CPU CFS quota period value, `cpu.cfs_period_us`.
+	// The value must be between 1 ms and 1 second, inclusive.
+	// Default: "100ms"
+	// +optional
+	// +kubebuilder:default="100ms"
+	// TODO: validation
+	CPUCFSQuotaPeriod metav1.Duration `json:"cpuCFSQuotaPeriod,omitempty"`
+	// ImageGCHighThresholdPercent is the percent of disk usage after which image
+	// garbage collection is always run. The percent is calculated by dividing this
+	// field value by 100, so this field must be between 0 and 100, inclusive.
+	// When specified, the value must be greater than ImageGCLowThresholdPercent.
+	// Note: AKS CustomKubeletConfig does not have "Percent" in the field name
+	// +kubebuilder:validation:Minimum:=0
+	// +kubebuilder:validation:Maximum:=100
+	// +optional
+	ImageGCHighThresholdPercent *int32 `json:"imageGCHighThresholdPercent,omitempty"`
+	// ImageGCLowThresholdPercent is the percent of disk usage before which image
+	// garbage collection is never run. Lowest disk usage to garbage collect to.
+	// The percent is calculated by dividing this field value by 100,
+	// so the field value must be between 0 and 100, inclusive.
+	// When specified, the value must be less than imageGCHighThresholdPercent
+	// Note: AKS CustomKubeletConfig does not have "Percent" in the field name
+	// +kubebuilder:validation:Minimum:=0
+	// +kubebuilder:validation:Maximum:=100
+	// +optional
+	ImageGCLowThresholdPercent *int32 `json:"imageGCLowThresholdPercent,omitempty"`
+	// topologyManagerPolicy is the name of the topology manager policy to use.
+	// Valid values include:
+	//
+	// - `restricted`: kubelet only allows pods with optimal NUMA node alignment for requested resources;
+	// - `best-effort`: kubelet will favor pods with NUMA alignment of CPU and device resources;
+	// - `none`: kubelet has no knowledge of NUMA alignment of a pod's CPU and device resources.
+	// - `single-numa-node`: kubelet only allows pods with a single NUMA alignment
+	//   of CPU and device resources.
+	//
+	// +kubebuilder:validation:Enum:={restricted,best-effort,none,single-numa-node}
+	// +kubebuilder:default="none"
+	// +optional
+	TopologyManagerPolicy string `json:"topologyManagerPolicy,omitempty"`
+	// A comma separated whitelist of unsafe sysctls or sysctl patterns (ending in `*`).
+	// Unsafe sysctl groups are `kernel.shm*`, `kernel.msg*`, `kernel.sem`, `fs.mqueue.*`,
+	// and `net.*`. For example: "`kernel.msg*,net.ipv4.route.min_pmtu`"
+	// Default: []
+	// TODO: validation
+	// +optional
+	AllowedUnsafeSysctls []string `json:"allowedUnsafeSysctls,omitempty"`
+	// containerLogMaxSize is a quantity defining the maximum size of the container log
+	// file before it is rotated. For example: "5Mi" or "256Ki".
+	// Default: "10Mi"
+	// AKS CustomKubeletConfig has containerLogMaxSizeMB (with units), defaults to 50
+	// +kubebuilder:validation:Pattern=`^\d+(E|P|T|G|M|K|Ei|Pi|Ti|Gi|Mi|Ki)$`
+	// +kubebuilder:default="50Mi"
+	// +optional
+	ContainerLogMaxSize string `json:"containerLogMaxSize,omitempty"`
+	// containerLogMaxFiles specifies the maximum number of container log files that can be present for a container.
+	// Default: 5
+	// +kubebuilder:validation:Minimum:=2
+	// +kubebuilder:default=5
+	// +optional
+	ContainerLogMaxFiles *int32 `json:"containerLogMaxFiles,omitempty"`
+	// podPidsLimit is the maximum number of PIDs in any pod.
+	// AKS CustomKubeletConfig uses PodMaxPids, int32 (!)
+	// Default: -1
+	// +optional
+	PodPidsLimit *int64 `json:"podPidsLimit,omitempty"`
+}
+
+// AKSNodeClass is the Schema for the AKSNodeClass API
+// +kubebuilder:object:root=true
+// +kubebuilder:resource:path=aksnodeclasses,scope=Cluster,categories={karpenter,nap},shortName={aksnc,aksncs}
+// +kubebuilder:printcolumn:name="Ready",type=string,JSONPath=".status.conditions[?(@.type=='Ready')].status"
+// +kubebuilder:printcolumn:name="Age",type=date,JSONPath=".metadata.creationTimestamp"
+// +kubebuilder:printcolumn:name="ImageFamily",type=string,JSONPath=".spec.imageFamily",priority=1
+// +kubebuilder:storageversion
+// +kubebuilder:subresource:status
+type AKSNodeClass struct {
+	metav1.TypeMeta   `json:",inline"`
+	metav1.ObjectMeta `json:"metadata,omitempty"`
+
+	Spec   AKSNodeClassSpec   `json:"spec,omitempty"`
+	Status AKSNodeClassStatus `json:"status,omitempty"`
+}
+
+// We need to bump the AKSNodeClassHashVersion when we make an update to the AKSNodeClass CRD under these conditions:
+// 1. A field changes its default value for an existing field that is already hashed
+// 2. A field is added to the hash calculation with an already-set value
+// 3. A field is removed from the hash calculations
+const AKSNodeClassHashVersion = "v3"
+
+func (in *AKSNodeClass) Hash() string {
+	return fmt.Sprint(lo.Must(hashstructure.Hash(in.Spec, hashstructure.FormatV2, &hashstructure.HashOptions{
+		SlicesAsSets:    true,
+		IgnoreZeroValue: true,
+		ZeroNil:         true,
+	})))
+}
+
+// AKSNodeClassList contains a list of AKSNodeClass
+// +kubebuilder:object:root=true
+type AKSNodeClassList struct {
+	metav1.TypeMeta `json:",inline"`
+	metav1.ListMeta `json:"metadata,omitempty"`
+	Items           []AKSNodeClass `json:"items"`
+}
+
+// GetEncryptionAtHost returns whether encryption at host is enabled for the node class.
+// Returns false if Security or EncryptionAtHost is nil.
+func (in *AKSNodeClass) GetEncryptionAtHost() bool {
+	if in.Spec.Security != nil && in.Spec.Security.EncryptionAtHost != nil {
+		return *in.Spec.Security.EncryptionAtHost
+	}
+	return false
+}

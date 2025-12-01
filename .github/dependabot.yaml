@@ -13,7 +13,6 @@ updates:
         patterns:
           - "k8s.io/*"
           - "sigs.k8s.io/*"
-          - "knative.dev/*"
         exclude-patterns:
           - "sigs.k8s.io/karpenter"
       go-deps:
@@ -22,9 +21,13 @@ updates:
         exclude-patterns:
           - "k8s.io/*"
           - "sigs.k8s.io/*"
-          - "knative.dev/*"
   - package-ecosystem: docker
-    directory: /.devcontainer
+    directories:
+      - /.devcontainer/**/*
+    groups:
+      devcontainer-deps:
+        patterns:
+          - "*"
     schedule:
       interval: "weekly"
   - package-ecosystem: docker

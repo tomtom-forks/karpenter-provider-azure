@@ -17,21 +17,30 @@ limitations under the License.
 package expectations
 
 import (
+	"context"
 	"encoding/base64"
 	"fmt"
 	"strings"
+	"sync"
+	"time"
 
+	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/compute/armcompute/v7"
 	"github.com/Azure/karpenter-provider-azure/pkg/test"
+	"github.com/Azure/skewer"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	"github.com/samber/lo"
+
+	corev1 "k8s.io/api/core/v1"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
-func ExpectUnavailable(env *test.Environment, instanceType string, zone string, capacityType string) {
+func ExpectUnavailable(env *test.Environment, sku *skewer.SKU, zone string, capacityType string) {
 	GinkgoHelper()
-	Expect(env.UnavailableOfferingsCache.IsUnavailable(instanceType, zone, capacityType)).To(BeTrue())
+	Expect(env.UnavailableOfferingsCache.IsUnavailable(sku, zone, capacityType)).To(BeTrue())
 }
 
-func ExpectKubeletFlags(env *test.Environment, customData string, expectedFlags map[string]string) {
+func ExpectKubeletFlags(_ *test.Environment, customData string, expectedFlags map[string]string) {
 	GinkgoHelper()
 	kubeletFlags := customData[strings.Index(customData, "KUBELET_FLAGS=")+len("KUBELET_FLAGS=") : strings.Index(customData, "KUBELET_NODE_LABELS")]
 	for flag, value := range expectedFlags {
@@ -52,4 +61,86 @@ func ExpectDecodedCustomData(env *test.Environment) string {
 	decodedString := string(decodedBytes[:])
 
 	return decodedString
+}
+
+func ExpectCSEProvisioned(env *test.Environment) armcompute.VirtualMachineExtension {
+	GinkgoHelper()
+	var cse armcompute.VirtualMachineExtension
+
+	// CSE provisioning is asynchronous, starting after VM creation LRO completes
+	Eventually(func() bool {
+		GinkgoHelper()
+		cseRaw, ok := env.VirtualMachineExtensionsAPI.Extensions.Load("cse-agent-karpenter")
+		if ok {
+			cse = cseRaw.(armcompute.VirtualMachineExtension)
+			return true
+		}
+		return false
+	}).Should((BeTrue()), "Expected CSE extension to be created")
+
+	return cse
+}
+
+func ExpectCSENotProvisioned(env *test.Environment) {
+	GinkgoHelper()
+
+	time.Sleep(1 * time.Second)
+	_, ok := env.VirtualMachineExtensionsAPI.Extensions.Load("cse-agent-karpenter")
+	Expect(ok).To(BeFalse(), "Expected CSE extension should not be created, but it was found")
+}
+
+// ExpectCleanUp handled the cleanup of all Objects we need within testing that core does not
+//
+// Core's ExpectCleanedUp function does not currently cleanup ConfigMaps:
+// https://github.com/kubernetes-sigs/karpenter/blob/db8df23ffb0b689b116d99597316612c98d382ab/pkg/test/expectations/expectations.go#L244
+// TODO: surface this within core and remove this function
+func ExpectCleanUp(ctx context.Context, c client.Client) {
+	GinkgoHelper()
+	wg := sync.WaitGroup{}
+	namespaces := &corev1.NamespaceList{}
+	Expect(c.List(ctx, namespaces)).To(Succeed())
+	for _, object := range []client.Object{
+		&corev1.ConfigMap{},
+	} {
+		for _, namespace := range namespaces.Items {
+			wg.Add(1)
+			go func(object client.Object, namespace string) {
+				GinkgoHelper()
+				defer wg.Done()
+				defer GinkgoRecover()
+				Expect(c.DeleteAllOf(ctx, object, client.InNamespace(namespace),
+					&client.DeleteAllOfOptions{DeleteOptions: client.DeleteOptions{GracePeriodSeconds: lo.ToPtr(int64(0))}})).ToNot(HaveOccurred())
+			}(object, namespace.Name)
+		}
+	}
+	wg.Wait()
+}
+
+func ExpectInstanceResourcesHaveTags(ctx context.Context, name string, azureEnv *test.Environment, tags map[string]*string) *armcompute.VirtualMachine {
+	GinkgoHelper()
+
+	// The VM should be updated
+	updatedVM, err := azureEnv.VMInstanceProvider.Get(ctx, name)
+	Expect(err).ToNot(HaveOccurred())
+
+	Expect(updatedVM.Tags).To(Equal(tags), "Expected VM tags to match")
+	// Expect the identities to remain unchanged
+	Expect(updatedVM.Identity).To(BeNil())
+
+	// The NIC should be updated
+	updatedNIC, err := azureEnv.NetworkInterfacesAPI.Get(ctx, azureEnv.AzureResourceGraphAPI.ResourceGroup, name, nil)
+	Expect(err).ToNot(HaveOccurred())
+	Expect(updatedNIC.Tags).To(Equal(tags), "Expected NIC tags to match")
+
+	// The extensions should be updated -- Note that we expect only 1 Extension update here because we're simulating scriptless
+	// mode which doesn't have a CSE extension.
+	Expect(azureEnv.VirtualMachineExtensionsAPI.VirtualMachineExtensionsUpdateBehavior.CalledWithInput.Len()).To(Equal(1))
+	for i := 0; i < 1; i++ {
+		extUpdate := azureEnv.VirtualMachineExtensionsAPI.VirtualMachineExtensionsUpdateBehavior.CalledWithInput.Pop().VirtualMachineExtensionUpdate
+		Expect(extUpdate).ToNot(BeNil())
+		Expect(extUpdate.Tags).ToNot(BeNil())
+		Expect(extUpdate.Tags).To(Equal(tags), "Expected VM extension tags to match")
+	}
+
+	return updatedVM
 }

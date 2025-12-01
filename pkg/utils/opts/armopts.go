@@ -19,37 +19,32 @@ package opts
 import (
 	"net/http"
 	"os"
-	"time"
 
 	"log/slog"
 
 	shPolicy "github.com/Azure/aks-middleware/http/client/azuresdk/policy"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/arm"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/cloud"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
 	"github.com/Azure/karpenter-provider-azure/pkg/auth"
 )
 
-func DefaultArmOpts() *arm.ClientOptions {
+func DefaultARMOpts(cloudConfig cloud.Configuration, enableLogging bool) *arm.ClientOptions {
 	opts := &arm.ClientOptions{}
 	opts.Telemetry = DefaultTelemetryOpts()
 	opts.Retry = DefaultRetryOpts()
 	opts.Transport = defaultHTTPClient
+	opts.Cloud = cloudConfig
 
-	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
-	opts.PerCallPolicies = append(opts.PerCallPolicies, shPolicy.NewLoggingPolicy(*logger))
-	return opts
-}
-
-func DefaultNICClientOpts() *arm.ClientOptions {
-	opts := DefaultArmOpts()
+	if enableLogging {
+		logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+		opts.PerCallPolicies = append(opts.PerCallPolicies, shPolicy.NewLoggingPolicy(*logger))
+	}
 	return opts
 }
 
 func DefaultRetryOpts() policy.RetryOptions {
 	return policy.RetryOptions{
-		MaxRetries: 20,
-		// Note the default retry behavior is exponential backoff
-		RetryDelay: time.Second * 5,
 		// TODO: bsoghigian: Investigate if we want to leverage some of the status codes other than the defaults.
 		// the defaults are // StatusCodes specifies the HTTP status codes that indicate the operation should be retried.
 		// A nil slice will use the following values.

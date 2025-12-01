@@ -29,32 +29,25 @@ import (
 // ResourceSkus is a map of location to resource skus
 var ResourceSkus = make(map[string][]compute.ResourceSku)
 
-type MockSkuClientSingleton struct {
-	SKUClient *ResourceSKUsAPI
-}
-
-func (sc *MockSkuClientSingleton) GetInstance() skewer.ResourceClient {
-	return sc.SKUClient
-}
-
-func (sc *MockSkuClientSingleton) Reset() {
-	sc.SKUClient.Reset()
-}
-
 // assert that the fake implements the interface
 var _ skewer.ResourceClient = &ResourceSKUsAPI{}
 
 type ResourceSKUsAPI struct {
 	Location string
 	// skewer.ResourceClient
+	Error error
 }
 
 // Reset must be called between tests otherwise tests will pollute each other.
 func (s *ResourceSKUsAPI) Reset() {
 	//c.ResourceSKUsBehavior.Reset()
+	s.Error = nil
 }
 
 func (s *ResourceSKUsAPI) ListComplete(_ context.Context, _, _ string) (compute.ResourceSkusResultIterator, error) {
+	if s.Error != nil {
+		return compute.ResourceSkusResultIterator{}, s.Error
+	}
 	resourceSkus := ResourceSkus[s.Location]
 	return compute.NewResourceSkusResultIterator(
 		compute.NewResourceSkusResultPage(

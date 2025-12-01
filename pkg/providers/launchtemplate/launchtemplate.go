@@ -18,19 +18,19 @@ package launchtemplate
 
 import (
 	"context"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 	"strconv"
 	"strings"
 
-	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/compute/armcompute/v5"
-
-	"github.com/Azure/go-autorest/autorest/to"
+	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/compute/armcompute/v7"
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/imagefamily"
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/launchtemplate/parameters"
 	"github.com/Azure/karpenter-provider-azure/pkg/utils"
+	"github.com/blang/semver/v4"
 	"github.com/samber/lo"
 	v1 "k8s.io/api/core/v1"
 
-	"github.com/Azure/karpenter-provider-azure/pkg/apis/v1alpha2"
+	"github.com/Azure/karpenter-provider-azure/pkg/apis/v1beta1"
 	"github.com/Azure/karpenter-provider-azure/pkg/consts"
 	"github.com/Azure/karpenter-provider-azure/pkg/operator/options"
 	karpv1 "sigs.k8s.io/karpenter/pkg/apis/v1"
@@ -38,32 +38,32 @@ import (
 	"sigs.k8s.io/karpenter/pkg/scheduling"
 )
 
-const (
-	karpenterManagedTagKey = "karpenter.azure.com/cluster"
-
-	dataplaneLabel       = "kubernetes.azure.com/ebpf-dataplane"
-	azureCNIOverlayLabel = "kubernetes.azure.com/azure-cni-overlay"
-	subnetNameLabel      = "kubernetes.azure.com/network-subnet"
-	vnetGUIDLabel        = "kubernetes.azure.com/nodenetwork-vnetguid"
-	podNetworkTypeLabel  = "kubernetes.azure.com/podnetwork-type"
+var (
+	dataplaneLabel           = v1beta1.AKSLabelDomain + "/ebpf-dataplane"
+	azureCNIOverlayLabel     = v1beta1.AKSLabelDomain + "/azure-cni-overlay"
+	subnetNameLabel          = v1beta1.AKSLabelDomain + "/network-subnet"
+	vnetGUIDLabel            = v1beta1.AKSLabelDomain + "/nodenetwork-vnetguid"
+	podNetworkTypeLabel      = v1beta1.AKSLabelDomain + "/podnetwork-type"
+	networkStatelessCNILabel = v1beta1.AKSLabelDomain + "/network-stateless-cni"
 )
 
 type Template struct {
-	ScriptlessCustomData    string
-	ImageID                 string
-	SubnetID                string
-	Tags                    map[string]*string
-	CustomScriptsCustomData string
-	CustomScriptsCSE        string
-	IsWindows               bool
-	StorageProfileDiskType  string
-	StorageProfilePlacement armcompute.DiffDiskPlacement
-	StorageProfileSizeGB    float64
+	ScriptlessCustomData      string
+	ImageID                   string
+	SubnetID                  string
+	Tags                      map[string]*string
+	CustomScriptsCustomData   string
+	CustomScriptsCSE          string
+	IsWindows                 bool
+	StorageProfileDiskType    string
+	StorageProfileIsEphemeral bool
+	StorageProfilePlacement   armcompute.DiffDiskPlacement
+	StorageProfileSizeGB      int32
 }
 
 type Provider struct {
-	imageFamily             *imagefamily.Resolver
-	imageProvider           *imagefamily.Provider
+	imageFamily             imagefamily.Resolver
+	imageProvider           imagefamily.NodeImageProvider
 	caBundle                *string
 	clusterEndpoint         string
 	tenantID                string
@@ -78,7 +78,7 @@ type Provider struct {
 
 // TODO: add caching of launch templates
 
-func NewProvider(_ context.Context, imageFamily *imagefamily.Resolver, imageProvider *imagefamily.Provider, caBundle *string, clusterEndpoint string,
+func NewProvider(_ context.Context, imageFamily imagefamily.Resolver, imageProvider imagefamily.NodeImageProvider, caBundle *string, clusterEndpoint string,
 	tenantID, subscriptionID, clusterResourceGroup string, kubeletIdentityClientID, resourceGroup, location, vnetGUID, provisionMode string,
 ) *Provider {
 	return &Provider{
@@ -97,18 +97,24 @@ func NewProvider(_ context.Context, imageFamily *imagefamily.Resolver, imageProv
 	}
 }
 
-func (p *Provider) GetTemplate(ctx context.Context, nodeClass *v1alpha2.AKSNodeClass, nodeClaim *karpv1.NodeClaim,
-	instanceType *cloudprovider.InstanceType, additionalLabels map[string]string) (*Template, error) {
+func (p *Provider) GetTemplate(
+	ctx context.Context,
+	nodeClass *v1beta1.AKSNodeClass,
+	nodeClaim *karpv1.NodeClaim,
+	instanceType *cloudprovider.InstanceType,
+	additionalLabels map[string]string,
+) (*Template, error) {
 	staticParameters, err := p.getStaticParameters(ctx, instanceType, nodeClass, lo.Assign(nodeClaim.Labels, additionalLabels))
 	if err != nil {
 		return nil, err
 	}
 
-	kubeServerVersion, err := p.imageProvider.KubeServerVersion(ctx)
+	kubernetesVersion, err := nodeClass.GetKubernetesVersion()
 	if err != nil {
+		// Note: we check GetKubernetesVersion for errors at the start of the Create call, so this case should not happen.
 		return nil, err
 	}
-	staticParameters.KubernetesVersion = kubeServerVersion
+	staticParameters.KubernetesVersion = kubernetesVersion
 	templateParameters, err := p.imageFamily.Resolve(ctx, nodeClass, nodeClaim, instanceType, staticParameters)
 	if err != nil {
 		return nil, err
@@ -118,10 +124,17 @@ func (p *Provider) GetTemplate(ctx context.Context, nodeClass *v1alpha2.AKSNodeC
 		return nil, err
 	}
 
+	launchTemplate.Tags = Tags(options.FromContext(ctx), nodeClass, nodeClaim)
+
 	return launchTemplate, nil
 }
 
-func (p *Provider) getStaticParameters(ctx context.Context, instanceType *cloudprovider.InstanceType, nodeClass *v1alpha2.AKSNodeClass, labels map[string]string) (*parameters.StaticParameters, error) {
+func (p *Provider) getStaticParameters(
+	ctx context.Context,
+	instanceType *cloudprovider.InstanceType,
+	nodeClass *v1beta1.AKSNodeClass,
+	labels map[string]string,
+) (*parameters.StaticParameters, error) {
 	var arch string = karpv1.ArchitectureAmd64
 	if err := instanceType.Requirements.Compatible(scheduling.NewRequirements(scheduling.NewRequirement(v1.LabelArchStable, v1.NodeSelectorOpIn, karpv1.ArchitectureArm64))); err == nil {
 		arch = karpv1.ArchitectureArm64
@@ -131,7 +144,11 @@ func (p *Provider) getStaticParameters(ctx context.Context, instanceType *cloudp
 
 	if isAzureCNIOverlay(ctx) {
 		// TODO: make conditional on pod subnet
-		vnetLabels, err := p.getVnetInfoLabels(subnetID)
+		kubernetesVersion, err := nodeClass.GetKubernetesVersion()
+		if err != nil {
+			return nil, err
+		}
+		vnetLabels, err := p.getVnetInfoLabels(subnetID, kubernetesVersion)
 		if err != nil {
 			return nil, err
 		}
@@ -152,7 +169,6 @@ func (p *Provider) getStaticParameters(ctx context.Context, instanceType *cloudp
 	return &parameters.StaticParameters{
 		ClusterName:                    options.FromContext(ctx).ClusterName,
 		ClusterEndpoint:                p.clusterEndpoint,
-		Tags:                           nodeClass.Spec.Tags,
 		Labels:                         labels,
 		CABundle:                       p.caBundle,
 		Arch:                           arch,
@@ -176,10 +192,14 @@ func (p *Provider) getStaticParameters(ctx context.Context, instanceType *cloudp
 }
 
 func getAgentbakerNetworkPlugin(ctx context.Context) string {
-	if isAzureCNIOverlay(ctx) || isCiliumNodeSubnet(ctx) {
+	if isAzureCNIOverlay(ctx) || isCiliumNodeSubnet(ctx) || isNetworkPluginNone(ctx) {
 		return consts.NetworkPluginNone
 	}
 	return consts.NetworkPluginAzure
+}
+
+func isNetworkPluginNone(ctx context.Context) bool {
+	return options.FromContext(ctx).NetworkPlugin == consts.NetworkPluginNone
 }
 
 func isCiliumNodeSubnet(ctx context.Context) bool {
@@ -191,16 +211,14 @@ func isAzureCNIOverlay(ctx context.Context) bool {
 }
 
 func (p *Provider) createLaunchTemplate(ctx context.Context, params *parameters.Parameters) (*Template, error) {
-	// merge and convert to ARM tags
-	azureTags := mergeTags(params.Tags, map[string]string{karpenterManagedTagKey: params.ClusterName})
 	template := &Template{
-		ImageID:                 params.ImageID,
-		Tags:                    azureTags,
-		SubnetID:                params.SubnetID,
-		IsWindows:               params.IsWindows,
-		StorageProfileDiskType:  params.StorageProfileDiskType,
-		StorageProfilePlacement: params.StorageProfilePlacement,
-		StorageProfileSizeGB:    params.StorageProfileSizeGB,
+		ImageID:                   params.ImageID,
+		SubnetID:                  params.SubnetID,
+		IsWindows:                 params.IsWindows,
+		StorageProfileDiskType:    params.StorageProfileDiskType,
+		StorageProfileIsEphemeral: params.StorageProfileIsEphemeral,
+		StorageProfilePlacement:   params.StorageProfilePlacement,
+		StorageProfileSizeGB:      params.StorageProfileSizeGB,
 	}
 
 	if p.provisionMode == consts.ProvisionModeBootstrappingClient {
@@ -222,15 +240,7 @@ func (p *Provider) createLaunchTemplate(ctx context.Context, params *parameters.
 	return template, nil
 }
 
-// MergeTags takes a variadic list of maps and merges them together
-// with format acceptable to ARM (no / in keys, pointer to strings as values)
-func mergeTags(tags ...map[string]string) (result map[string]*string) {
-	return lo.MapEntries(lo.Assign(tags...), func(key string, value string) (string, *string) {
-		return strings.ReplaceAll(key, "/", "_"), to.StringPtr(value)
-	})
-}
-
-func (p *Provider) getVnetInfoLabels(subnetID string) (map[string]string, error) {
+func (p *Provider) getVnetInfoLabels(subnetID string, kubernetesVersion string) (map[string]string, error) {
 	vnetSubnetComponents, err := utils.GetVnetSubnetIDComponents(subnetID)
 	if err != nil {
 		return nil, err
@@ -241,5 +251,13 @@ func (p *Provider) getVnetInfoLabels(subnetID string) (map[string]string, error)
 		azureCNIOverlayLabel: strconv.FormatBool(true),
 		podNetworkTypeLabel:  consts.NetworkPluginModeOverlay,
 	}
+
+	parsedVersion, err := semver.ParseTolerant(strings.TrimPrefix(kubernetesVersion, "v"))
+	// Sanity Check: in production we should always have a k8s version set
+	if err != nil {
+		return nil, err
+	}
+	vnetLabels[networkStatelessCNILabel] = lo.Ternary(parsedVersion.GE(semver.Version{Major: 1, Minor: 34}), "true", "false")
+
 	return vnetLabels, nil
 }

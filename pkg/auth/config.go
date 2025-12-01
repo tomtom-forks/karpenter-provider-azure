@@ -17,12 +17,12 @@ limitations under the License.
 package auth
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"strings"
 
 	"github.com/Azure/go-autorest/autorest"
-	"github.com/Azure/go-autorest/autorest/azure"
 )
 
 type cfgField struct {
@@ -42,17 +42,12 @@ type ClientConfig struct {
 
 // Config holds the configuration parsed from the --cloud-config flag
 type Config struct {
-	Cloud          string `json:"cloud" yaml:"cloud"`
-	Location       string `json:"location" yaml:"location"`
-	TenantID       string `json:"tenantId" yaml:"tenantId"`
-	SubscriptionID string `json:"subscriptionId" yaml:"subscriptionId"`
-	ResourceGroup  string `json:"resourceGroup" yaml:"resourceGroup"`
-
-	// Managed identity for Kubelet (not to be confused with Azure cloud authorization)
-	KubeletIdentityClientID string `json:"kubeletIdentityClientID" yaml:"kubeletIdentityClientID"`
-
-	// Configs only for AKS
-	NodeResourceGroup string `json:"nodeResourceGroup" yaml:"nodeResourceGroup"`
+	Cloud                    string `json:"cloud" yaml:"cloud"`
+	Location                 string `json:"location" yaml:"location"`
+	TenantID                 string `json:"tenantId" yaml:"tenantId"`
+	SubscriptionID           string `json:"subscriptionId" yaml:"subscriptionId"`
+	ResourceGroup            string `json:"resourceGroup" yaml:"resourceGroup"`
+	AzureEnvironmentFilepath string `json:"azureEnvironmentFilepath" yaml:"azureEnvironmentFilepath"`
 }
 
 // BuildAzureConfig returns a Config object for the Azure clients
@@ -72,17 +67,6 @@ func BuildAzureConfig() (*Config, error) {
 	return cfg, nil
 }
 
-func (cfg *Config) GetAzureClientConfig(authorizer autorest.Authorizer, env *azure.Environment) *ClientConfig {
-	azClientConfig := &ClientConfig{
-		Location:                cfg.Location,
-		SubscriptionID:          cfg.SubscriptionID,
-		ResourceManagerEndpoint: env.ResourceManagerEndpoint,
-		Authorizer:              authorizer,
-	}
-
-	return azClientConfig
-}
-
 func (cfg *Config) Build() error {
 	// May require more than this behind the scenes: https://github.com/Azure/azure-sdk-for-go/blob/main/sdk/azidentity/README.md#defaultazurecredential
 	cfg.Cloud = strings.TrimSpace(os.Getenv("ARM_CLOUD"))
@@ -90,22 +74,29 @@ func (cfg *Config) Build() error {
 	cfg.ResourceGroup = strings.TrimSpace(os.Getenv("ARM_RESOURCE_GROUP"))
 	cfg.TenantID = strings.TrimSpace(os.Getenv("ARM_TENANT_ID"))
 	cfg.SubscriptionID = strings.TrimSpace(os.Getenv("ARM_SUBSCRIPTION_ID"))
-	cfg.NodeResourceGroup = strings.TrimSpace(os.Getenv("AZURE_NODE_RESOURCE_GROUP"))
-	cfg.KubeletIdentityClientID = strings.TrimSpace(os.Getenv("KUBELET_IDENTITY_CLIENT_ID"))
+	cfg.AzureEnvironmentFilepath = strings.TrimSpace(os.Getenv("AZURE_ENVIRONMENT_FILEPATH"))
 
 	return nil
 }
 
 func (cfg *Config) Default() error {
-	// Nothing to default, for now.
+	// Default is AzurePublicCloud if not set
+	if cfg.Cloud == "" && cfg.AzureEnvironmentFilepath == "" {
+		cfg.Cloud = "AzurePublicCloud"
+	}
+
 	return nil
 }
 
 func (cfg *Config) Validate() error {
+	// Validate that ARM_CLOUD and AZURE_ENVIRONMENT_FILEPATH are not both set
+	if cfg.Cloud != "" && cfg.AzureEnvironmentFilepath != "" {
+		return fmt.Errorf("ARM_CLOUD and AZURE_ENVIRONMENT_FILEPATH cannot both be set - please use only one cloud configuration method")
+	}
+
 	// Setup fields and validate all of them are not empty
 	fields := []cfgField{
 		{cfg.SubscriptionID, "subscription ID"},
-		{cfg.NodeResourceGroup, "node resource group"},
 		// Even though the config doesnt use some of these,
 		// its good to validate they were set in the environment
 	}
@@ -117,4 +108,13 @@ func (cfg *Config) Validate() error {
 	}
 
 	return nil
+}
+
+func (cfg *Config) String() string {
+	json, err := json.Marshal(cfg)
+	if err != nil {
+		return fmt.Sprintf("couldn't marshal Config JSON: %s", err)
+	}
+
+	return string(json)
 }
