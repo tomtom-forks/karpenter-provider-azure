@@ -90,17 +90,18 @@ func (u Ubuntu2004) ScriptlessCustomData(
 ) bootstrap.Bootstrapper {
 	return bootstrap.AKS{
 		Options: bootstrap.Options{
-			ClusterName:      u.Options.ClusterName,
-			ClusterEndpoint:  u.Options.ClusterEndpoint,
-			KubeletConfig:    kubeletConfig,
-			Taints:           taints,
-			Labels:           labels,
-			CABundle:         caBundle,
-			GPUNode:          u.Options.GPUNode,
-			GPUDriverVersion: u.Options.GPUDriverVersion,
-			GPUDriverType:    u.Options.GPUDriverType,
-			GPUImageSHA:      u.Options.GPUImageSHA,
-			SubnetID:         u.Options.SubnetID,
+			ClusterName:                  u.Options.ClusterName,
+			ClusterEndpoint:              u.Options.ClusterEndpoint,
+			KubeletConfig:                kubeletConfig,
+			Taints:                       taints,
+			Labels:                       labels,
+			CABundle:                     caBundle,
+			GPUNode:                      u.Options.GPUNode,
+			GPUDriverVersion:             u.Options.GPUDriverVersion,
+			GPUDriverType:                u.Options.GPUDriverType,
+			GPUImageSHA:                  u.Options.GPUImageSHA,
+			GPUDriverInstallationEnabled: u.Options.GPUDriverInstallationEnabled,
+			SubnetID:                     u.Options.SubnetID,
 		},
 		Arch:                           u.Options.Arch,
 		TenantID:                       u.Options.TenantID,
@@ -108,7 +109,8 @@ func (u Ubuntu2004) ScriptlessCustomData(
 		Location:                       u.Options.Location,
 		KubeletIdentityClientID:        u.Options.KubeletIdentityClientID,
 		ResourceGroup:                  u.Options.ResourceGroup,
-		ClusterID:                      u.Options.ClusterID,
+		NetworkSecurityGroupName:       u.Options.NetworkSecurityGroupName,
+		RouteTableName:                 u.Options.RouteTableName,
 		APIServerName:                  u.Options.APIServerName,
 		KubeletClientTLSBootstrapToken: u.Options.KubeletClientTLSBootstrapToken,
 		NetworkPlugin:                  u.Options.NetworkPlugin,
@@ -128,6 +130,9 @@ func (u Ubuntu2004) CustomScriptsNodeBootstrapping(
 	storageProfile string,
 	nodeBootstrappingClient types.NodeBootstrappingAPI,
 	fipsMode *v1beta1.FIPSMode,
+	_ *v1beta1.LocalDNS, // Ubuntu 20.04 does not support LocalDNS
+	artifactStreaming *v1beta1.ArtifactStreaming,
+	linuxOSConfig *v1beta1.LinuxOSConfiguration,
 ) customscriptsbootstrap.Bootstrapper {
 	return customscriptsbootstrap.ProvisionClientBootstrap{
 		ClusterName:                    u.Options.ClusterName,
@@ -145,8 +150,11 @@ func (u Ubuntu2004) CustomScriptsNodeBootstrapping(
 		InstanceType:                   instanceType,
 		StorageProfile:                 storageProfile,
 		ClusterResourceGroup:           u.Options.ClusterResourceGroup,
+		GPUDriverInstallationEnabled:   u.Options.GPUDriverInstallationEnabled,
 		NodeBootstrappingProvider:      nodeBootstrappingClient,
 		OSSKU:                          customscriptsbootstrap.ImageFamilyOSSKUUbuntu2004,
 		FIPSMode:                       fipsMode,
+		ArtifactStreaming:              artifactStreaming,
+		LinuxOSConfig:                  linuxOSConfig,
 	}
 }

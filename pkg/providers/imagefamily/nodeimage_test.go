@@ -44,7 +44,7 @@ const (
 	cigImageVersion      = "202505.27.0"
 	laterCIGImageVersion = "202605.27.0"
 
-	sigImageVersion = "202505.27.0"
+	sigImageVersion = "202512.18.0" // Updated to match fake data versions
 )
 
 func renderExpectedCIGNodeImages(
@@ -148,7 +148,7 @@ var _ = Describe("NodeImageProvider tests", func() {
 
 		It("should match expected images for AzureLinux with version < 1.32", func() {
 			nodeClass.Spec.ImageFamily = lo.ToPtr(v1beta1.AzureLinuxImageFamily)
-			nodeClass.Status.KubernetesVersion = "1.31.0"
+			nodeClass.Status.KubernetesVersion = lo.ToPtr("1.31.0")
 
 			foundImages, err := nodeImageProvider.List(ctx, nodeClass)
 			Expect(err).ToNot(HaveOccurred())
@@ -158,16 +158,15 @@ var _ = Describe("NodeImageProvider tests", func() {
 
 		It("should match expected images for AzureLinux with version >= 1.32", func() {
 			nodeClass.Spec.ImageFamily = lo.ToPtr(v1beta1.AzureLinuxImageFamily)
-			nodeClass.Status.KubernetesVersion = "1.32.0"
+			nodeClass.Status.KubernetesVersion = lo.ToPtr("1.32.0")
 
 			foundImages, err := nodeImageProvider.List(ctx, nodeClass)
 			Expect(err).ToNot(HaveOccurred())
 
 			expectedImages := renderExpectedCIGNodeImages(&imagefamily.AzureLinux3{}, nodeClass.Spec.FIPSMode, cigImageVersion)
 			Expect(foundImages).To(Equal(expectedImages))
-
-			// Explicitly verify ARM64 image is NOT included in CIG (Community Image Gallery)
-			Expect(foundImages).ToNot(ContainElement(HaveField("ID", ContainSubstring("V3gen2arm64"))))
+			// Explicitly verify ARM64 image is included in CIG (Community Image Gallery) - was disabled in the past
+			Expect(foundImages).To(ContainElement(HaveField("ID", ContainSubstring(imagefamily.AzureLinux3Gen2ArmImageDefinition))))
 		})
 	})
 
@@ -357,7 +356,7 @@ var _ = Describe("NodeImageProvider tests", func() {
 			func(imageFamily *string, fipsMode *v1beta1.FIPSMode, kubernetesVersion string) {
 				nodeClass.Spec.ImageFamily = imageFamily
 				nodeClass.Spec.FIPSMode = fipsMode
-				nodeClass.Status.KubernetesVersion = kubernetesVersion
+				nodeClass.Status.KubernetesVersion = lo.ToPtr(kubernetesVersion)
 
 				foundImages, err := nodeImageProvider.List(ctx, nodeClass)
 				Expect(err).ToNot(HaveOccurred())
@@ -376,10 +375,11 @@ var _ = Describe("NodeImageProvider tests", func() {
 				Expect(foundImages).To(Equal(expectedImages))
 
 				if k8sVersion.GE(semver.Version{Major: 1, Minor: 32}) && lo.FromPtr(nodeClass.Spec.FIPSMode) != v1beta1.FIPSModeFIPS {
-					// Explicitly verify ARM64 image IS included in SIG (Shared Image Gallery)
+					// Explicitly verify ARM64 image is still included in SIG (Shared Image Gallery)
+					// - it was previously disabled and re-enabled for CIG (Community Image Gallery)
 					Expect(foundImages).To(ContainElement(And(
-						HaveField("ID", ContainSubstring("V3gen2arm64")),
-						Not(HaveField("ID", ContainSubstring("V3gen2arm64fips"))),
+						HaveField("ID", ContainSubstring(imagefamily.AzureLinux3Gen2ArmImageDefinition)),
+						Not(HaveField("ID", ContainSubstring(imagefamily.AzureLinux3Gen2Arm64FIPSImageDefinition))),
 					)))
 				}
 			},
@@ -425,7 +425,7 @@ var _ = Describe("NodeImageProvider tests", func() {
 			It("should select Ubuntu2204 for generic Ubuntu when K8s < 1.34", func() {
 				nodeClass.Spec.ImageFamily = lo.ToPtr(v1beta1.UbuntuImageFamily)
 				nodeClass.Spec.FIPSMode = nil
-				nodeClass.Status.KubernetesVersion = "1.33.0"
+				nodeClass.Status.KubernetesVersion = lo.ToPtr("1.33.0")
 
 				foundImages, err := nodeImageProvider.List(ctx, nodeClass)
 				Expect(err).ToNot(HaveOccurred())
@@ -438,7 +438,7 @@ var _ = Describe("NodeImageProvider tests", func() {
 			It("should select Ubuntu2404 for generic Ubuntu when K8s >= 1.34", func() {
 				nodeClass.Spec.ImageFamily = lo.ToPtr(v1beta1.UbuntuImageFamily)
 				nodeClass.Spec.FIPSMode = nil
-				nodeClass.Status.KubernetesVersion = "1.34.0"
+				nodeClass.Status.KubernetesVersion = lo.ToPtr("1.34.0")
 
 				foundImages, err := nodeImageProvider.List(ctx, nodeClass)
 				Expect(err).ToNot(HaveOccurred())
@@ -452,7 +452,7 @@ var _ = Describe("NodeImageProvider tests", func() {
 			It("should select Ubuntu2204 as default when K8s < 1.34 and no image family specified", func() {
 				nodeClass.Spec.ImageFamily = nil // No image family specified
 				nodeClass.Spec.FIPSMode = nil
-				nodeClass.Status.KubernetesVersion = "1.33.0"
+				nodeClass.Status.KubernetesVersion = lo.ToPtr("1.33.0")
 
 				foundImages, err := nodeImageProvider.List(ctx, nodeClass)
 				Expect(err).ToNot(HaveOccurred())
@@ -465,7 +465,7 @@ var _ = Describe("NodeImageProvider tests", func() {
 			It("should select Ubuntu2404 as default when K8s >= 1.34 and no image family specified", func() {
 				nodeClass.Spec.ImageFamily = nil // No image family specified
 				nodeClass.Spec.FIPSMode = nil
-				nodeClass.Status.KubernetesVersion = "1.34.0"
+				nodeClass.Status.KubernetesVersion = lo.ToPtr("1.34.0")
 
 				foundImages, err := nodeImageProvider.List(ctx, nodeClass)
 				Expect(err).ToNot(HaveOccurred())

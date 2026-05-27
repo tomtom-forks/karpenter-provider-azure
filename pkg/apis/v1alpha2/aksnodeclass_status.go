@@ -27,33 +27,70 @@ const (
 	ConditionTypeImagesReady            = "ImagesReady"
 	ConditionTypeKubernetesVersionReady = "KubernetesVersionReady"
 	ConditionTypeSubnetsReady           = "SubnetsReady"
+	ConditionTypeLocalDNSReady          = "LocalDNSReady"
+)
+
+// LocalDNSState is the resolved enable/disable decision for LocalDNS on the
+// NodeClass. It represents the current LocalDNS enablement state at the
+// moment, derived from Spec.LocalDNS.Mode and cluster conditions:
+//   - Mode=Required -> Enabled
+//   - Mode=Disabled -> Disabled
+//   - Mode=Preferred -> resolved by gate evaluation. Once Mode=Preferred
+//     resolves to Enabled, it remains Enabled while Mode stays Preferred;
+//     it does not flip back to Disabled if cluster-side conflicts later
+//     appear. The user can opt out by changing Mode to Disabled.
+//
+// Any new node spawned from this NodeClass uses this value as the source
+// of truth for LocalDNS enablement, regardless of when cluster-side
+// conditions changed.
+type LocalDNSState string
+
+const (
+	LocalDNSStateEnabled  LocalDNSState = "Enabled"
+	LocalDNSStateDisabled LocalDNSState = "Disabled"
 )
 
 // NodeImage contains resolved image selector values utilized for node launch
 type NodeImage struct {
-	// The ID of the image. Examples:
+	// id is the ID of the image. Examples:
 	// - CIG: /CommunityGalleries/AKSUbuntu-38d80f77-467a-481f-a8d4-09b6d4220bd2/images/2204gen2containerd/versions/2022.10.03
 	// - SIG: /subscriptions/10945678-1234-1234-1234-123456789012/resourceGroups/AKS-Ubuntu/providers/Microsoft.Compute/galleries/AKSUbuntu/images/2204gen2containerd/versions/2022.10.03
 	// +required
+	//nolint:kubeapilinter // requiredfields: validation is intentionally not enforced for this field
 	ID string `json:"id"`
-	// Requirements of the image to be utilized on an instance type
+	// requirements of the image to be utilized on an instance type
 	// +required
+	//nolint:kubeapilinter // requiredfields: omitempty is intentionally omitted for this field
 	Requirements []corev1.NodeSelectorRequirement `json:"requirements"`
 }
 
 // AKSNodeClassStatus contains the resolved state of the AKSNodeClass
 type AKSNodeClassStatus struct {
-	// Images contains the current set of images available to use
+	// images contains the current set of images available to use
 	// for the NodeClass
 	// +optional
+	//nolint:kubeapilinter // ssatags: adding listType marker would be a breaking change
 	Images []NodeImage `json:"images,omitempty"`
-	// KubernetesVersion contains the current kubernetes version which should be
+	// kubernetesVersion contains the current kubernetes version which should be
 	// used for nodes provisioned for the NodeClass
 	// +optional
-	KubernetesVersion string `json:"kubernetesVersion,omitempty"`
-	// Conditions contains signals for health and readiness
+	KubernetesVersion *string `json:"kubernetesVersion,omitempty"`
+	// conditions contains signals for health and readiness
 	// +optional
+	//nolint:kubeapilinter // conditions: using status.Condition from operatorpkg instead of metav1.Condition for compatibility
 	Conditions []status.Condition `json:"conditions,omitempty"`
+	// localDNSState is the resolved enable/disable decision for LocalDNS.
+	// It is the source of truth for whether LocalDNS is enabled on nodes
+	// spawned from this NodeClass. When spec.mode=Required this is always Enabled;
+	// when spec.mode=Disabled this is always Disabled; when spec.mode=Preferred this is
+	// determined based on the current Kubernetes version and other cluster configuration.
+	// Once Mode=Preferred resolves to Enabled,
+	// it remains Enabled as long as spec.mode stays Preferred; it does not flip back
+	// to Disabled if cluster-side conflicts later appear. The user can opt
+	// out by changing Mode to Disabled.
+	// +optional
+	// +kubebuilder:validation:Enum:=Enabled;Disabled
+	LocalDNSState *LocalDNSState `json:"localDNSState,omitempty"`
 }
 
 func (in *AKSNodeClass) StatusConditions() status.ConditionSet {
@@ -61,6 +98,7 @@ func (in *AKSNodeClass) StatusConditions() status.ConditionSet {
 		ConditionTypeImagesReady,
 		ConditionTypeKubernetesVersionReady,
 		ConditionTypeSubnetsReady,
+		ConditionTypeLocalDNSReady,
 	}
 	return status.NewReadyConditions(conds...).For(in)
 }
@@ -79,7 +117,12 @@ func (in *AKSNodeClass) GetKubernetesVersion() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return in.Status.KubernetesVersion, nil
+
+	if in.Status.KubernetesVersion == nil {
+		return "", nil
+	}
+
+	return *in.Status.KubernetesVersion, nil
 }
 
 // validateKubernetesVersionReadiness will return nil if the the KubernetesVersion is considered valid to use,
@@ -99,7 +142,7 @@ func (in *AKSNodeClass) validateKubernetesVersionReadiness() error {
 		return fmt.Errorf("NodeClass condition %s, is in Ready=%s, %s", ConditionTypeKubernetesVersionReady, kubernetesVersionCondition.GetStatus(), kubernetesVersionCondition.Message)
 	} else if kubernetesVersionCondition.ObservedGeneration != in.GetGeneration() {
 		return fmt.Errorf("NodeClass condition %s ObservedGeneration %d does not match the NodeClass Generation %d", ConditionTypeKubernetesVersionReady, kubernetesVersionCondition.ObservedGeneration, in.GetGeneration())
-	} else if in.Status.KubernetesVersion == "" {
+	} else if in.Status.KubernetesVersion == nil || *in.Status.KubernetesVersion == "" {
 		return fmt.Errorf("NodeClass KubernetesVersion is uninitialized")
 	}
 	return nil

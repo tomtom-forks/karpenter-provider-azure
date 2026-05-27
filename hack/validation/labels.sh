@@ -9,6 +9,7 @@ rule=$'self.all(x, x in
         "karpenter.azure.com/aksnodeclass",
         "karpenter.azure.com/sku-name",
         "karpenter.azure.com/sku-family",
+        "karpenter.azure.com/sku-series",
         "karpenter.azure.com/sku-version",
         "karpenter.azure.com/sku-cpu",
         "karpenter.azure.com/sku-memory",
@@ -17,7 +18,8 @@ rule=$'self.all(x, x in
         "karpenter.azure.com/sku-storage-ephemeralos-maxsize",
         "karpenter.azure.com/sku-gpu-name",
         "karpenter.azure.com/sku-gpu-manufacturer",
-        "karpenter.azure.com/sku-gpu-count"
+        "karpenter.azure.com/sku-gpu-count",
+        "karpenter.azure.com/placement-scope"
     ]
     || !x.find("^([^/]+)").endsWith("karpenter.azure.com")
 )

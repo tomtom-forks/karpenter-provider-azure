@@ -94,23 +94,38 @@ func (t TaxBrackets) Calculate(amount float64) float64 {
 	return tax
 }
 
-func NewInstanceType(ctx context.Context, sku *skewer.SKU, vmsize *skewer.VMSizeType, kc *v1beta1.KubeletConfiguration, region string,
-	offerings cloudprovider.Offerings, nodeClass *v1beta1.AKSNodeClass, architecture string) *cloudprovider.InstanceType {
+func NewInstanceType(
+	ctx context.Context,
+	sku *skewer.SKU,
+	vmsize *skewer.VMSizeType,
+	kc *v1beta1.KubeletConfiguration,
+	region string,
+	offerings cloudprovider.Offerings,
+	nodeClass *v1beta1.AKSNodeClass,
+	architecture string,
+) *cloudprovider.InstanceType {
 	return &cloudprovider.InstanceType{
 		Name:         sku.GetName(),
-		Requirements: computeRequirements(sku, vmsize, architecture, offerings, region),
+		Requirements: computeRequirements(options.FromContext(ctx), sku, vmsize, architecture, offerings, region, nodeClass),
 		Offerings:    offerings,
 		Capacity:     computeCapacity(ctx, sku, nodeClass),
 		Overhead: &cloudprovider.InstanceTypeOverhead{
-			KubeReserved:      KubeReservedResources(lo.Must(sku.VCPU()), lo.Must(sku.Memory()), int64(*nodeClass.Spec.MaxPods)),
+			KubeReserved:      KubeReservedResources(lo.Must(sku.VCPU()), lo.Must(sku.Memory()), int64(lo.FromPtrOr(nodeClass.Spec.MaxPods, 110))),
 			SystemReserved:    SystemReservedResources(),
 			EvictionThreshold: EvictionThreshold(),
 		},
 	}
 }
 
-func computeRequirements(sku *skewer.SKU, vmsize *skewer.VMSizeType, architecture string,
-	offerings cloudprovider.Offerings, region string) scheduling.Requirements {
+func computeRequirements(
+	opts *options.Options,
+	sku *skewer.SKU,
+	vmsize *skewer.VMSizeType,
+	architecture string,
+	offerings cloudprovider.Offerings,
+	region string,
+	nodeClass *v1beta1.AKSNodeClass,
+) scheduling.Requirements {
 	requirements := scheduling.NewRequirements(
 		// Well Known Upstream
 		scheduling.NewRequirement(corev1.LabelInstanceTypeStable, corev1.NodeSelectorOpIn, sku.GetName()),
@@ -128,19 +143,29 @@ func computeRequirements(sku *skewer.SKU, vmsize *skewer.VMSizeType, architectur
 		})...),
 
 		// Well Known to Azure
+		scheduling.NewRequirement(v1beta1.LabelPlacementScope, corev1.NodeSelectorOpIn, lo.Map(offerings.Available(), func(o *cloudprovider.Offering, _ int) string {
+			return o.Requirements.Get(v1beta1.LabelPlacementScope).Any()
+		})...),
 		scheduling.NewRequirement(v1beta1.LabelSKUCPU, corev1.NodeSelectorOpIn, fmt.Sprint(vcpuCount(sku))),
 		scheduling.NewRequirement(v1beta1.LabelSKUMemory, corev1.NodeSelectorOpIn, fmt.Sprint((memoryMiB(sku)))), // in MiB
 		scheduling.NewRequirement(v1beta1.AKSLabelCPU, corev1.NodeSelectorOpIn, fmt.Sprint(vcpuCount(sku))),      // AKS domain.
 		scheduling.NewRequirement(v1beta1.AKSLabelMemory, corev1.NodeSelectorOpIn, fmt.Sprint((memoryMiB(sku)))), // AKS domain.
-		scheduling.NewRequirement(v1beta1.LabelSKUGPUCount, corev1.NodeSelectorOpIn, fmt.Sprint(gpuNvidiaCount(sku).Value())),
+		scheduling.NewRequirement(v1beta1.LabelSKUGPUCount, corev1.NodeSelectorOpIn, fmt.Sprint(gpuTotalCount(sku).Value())),
 		scheduling.NewRequirement(v1beta1.LabelSKUGPUManufacturer, corev1.NodeSelectorOpDoesNotExist),
 		scheduling.NewRequirement(v1beta1.LabelSKUGPUName, corev1.NodeSelectorOpDoesNotExist),
+		scheduling.NewRequirement(v1beta1.AKSLabelCluster, corev1.NodeSelectorOpIn, utils.NormalizeClusterResourceGroupNameForLabel(opts.NodeResourceGroup)),
+		scheduling.NewRequirement(v1beta1.AKSLabelMode, corev1.NodeSelectorOpIn, v1beta1.ModeSystem, v1beta1.ModeUser),
+		scheduling.NewRequirement(v1beta1.AKSLabelScaleSetPriority, corev1.NodeSelectorOpIn, v1beta1.ScaleSetPriorityRegular, v1beta1.ScaleSetPrioritySpot),
+		scheduling.NewRequirement(v1beta1.AKSLabelPriority, corev1.NodeSelectorOpIn, v1beta1.PriorityRegular, v1beta1.PrioritySpot),
+		scheduling.NewRequirement(v1beta1.AKSLabelOSSKU, corev1.NodeSelectorOpIn, v1beta1.GetOSSKUFromImageFamily(lo.FromPtr(nodeClass.Spec.ImageFamily))),
+		scheduling.NewRequirement(v1beta1.AKSLabelFIPSEnabled, corev1.NodeSelectorOpDoesNotExist), // AKS only sets this label if FIPS is enabled, otherwise it's expected to be empty
 
 		// composites
 		scheduling.NewRequirement(v1beta1.LabelSKUName, corev1.NodeSelectorOpDoesNotExist),
 
 		// size parts
 		scheduling.NewRequirement(v1beta1.LabelSKUFamily, corev1.NodeSelectorOpDoesNotExist),
+		scheduling.NewRequirement(v1beta1.LabelSKUSeries, corev1.NodeSelectorOpDoesNotExist),
 		scheduling.NewRequirement(v1beta1.LabelSKUVersion, corev1.NodeSelectorOpDoesNotExist),
 
 		// SKU capabilities
@@ -156,11 +181,15 @@ func computeRequirements(sku *skewer.SKU, vmsize *skewer.VMSizeType, architectur
 
 	// size parts
 	requirements[v1beta1.LabelSKUFamily].Insert(vmsize.Family)
+	requirements[v1beta1.LabelSKUSeries].Insert(vmsize.Series)
 
 	setRequirementsEphemeralOSDiskSupported(requirements, sku)
 	setRequirementsHyperVGeneration(requirements, sku)
 	setRequirementsGPU(requirements, sku, vmsize)
 	setRequirementsVersion(requirements, vmsize)
+	if lo.FromPtr(nodeClass.Spec.FIPSMode) == v1beta1.FIPSModeFIPS {
+		requirements[v1beta1.AKSLabelFIPSEnabled].Insert("true")
+	}
 
 	return requirements
 }
@@ -182,11 +211,17 @@ func setRequirementsHyperVGeneration(requirements scheduling.Requirements, sku *
 }
 
 func setRequirementsGPU(requirements scheduling.Requirements, sku *skewer.SKU, vmsize *skewer.VMSizeType) {
-	if utils.IsNvidiaEnabledSKU(sku.GetName()) {
+	manufacturer := utils.GetGPUManufacturer(sku.GetName())
+	switch manufacturer {
+	case v1beta1.ManufacturerNvidia:
 		requirements[v1beta1.LabelSKUGPUManufacturer].Insert(v1beta1.ManufacturerNvidia)
-		if vmsize.AcceleratorType != nil {
-			requirements[v1beta1.LabelSKUGPUName].Insert(*vmsize.AcceleratorType)
-		}
+	case v1beta1.ManufacturerAMD:
+		requirements[v1beta1.LabelSKUGPUManufacturer].Insert(v1beta1.ManufacturerAMD)
+	default:
+		return
+	}
+	if vmsize.AcceleratorType != nil {
+		requirements[v1beta1.LabelSKUGPUName].Insert(*vmsize.AcceleratorType)
 	}
 }
 
@@ -213,13 +248,35 @@ func computeCapacity(ctx context.Context, sku *skewer.SKU, nodeClass *v1beta1.AK
 		corev1.ResourceEphemeralStorage:       *ephemeralStorage(nodeClass),
 		corev1.ResourcePods:                   *pods(ctx, nodeClass),
 		corev1.ResourceName("nvidia.com/gpu"): *gpuNvidiaCount(sku),
+		corev1.ResourceName("amd.com/gpu"):    *gpuAMDCount(sku),
 	}
 }
 
-// gpuNvidiaCount returns the number of Nvidia GPUs in the SKU. Currently nvidia is the only gpu manufacturer we support.
+// gpuNvidiaCount returns the number of Nvidia GPUs in the SKU.
 func gpuNvidiaCount(sku *skewer.SKU) *resource.Quantity {
 	count, err := sku.GPU()
 	if err != nil || !utils.IsNvidiaEnabledSKU(sku.GetName()) {
+		count = 0
+	}
+	return resources.Quantity(fmt.Sprint(count))
+}
+
+// gpuAMDCount returns the number of AMD GPUs in the SKU.
+func gpuAMDCount(sku *skewer.SKU) *resource.Quantity {
+	count, err := sku.GPU()
+	if err != nil || !utils.IsAMDEnabledSKU(sku.GetName()) {
+		count = 0
+	}
+	return resources.Quantity(fmt.Sprint(count))
+}
+
+// gpuTotalCount returns the total number of GPUs in the SKU for any supported vendor.
+func gpuTotalCount(sku *skewer.SKU) *resource.Quantity {
+	if !utils.IsGPUSKU(sku.GetName()) {
+		return resources.Quantity("0")
+	}
+	count, err := sku.GPU()
+	if err != nil {
 		count = 0
 	}
 	return resources.Quantity(fmt.Sprint(count))

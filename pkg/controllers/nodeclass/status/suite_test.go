@@ -45,6 +45,7 @@ var env *coretest.Environment
 var azureEnv *test.Environment
 var nodeClass *v1beta1.AKSNodeClass
 var controller *status.Controller
+var testOptions *options.Options
 
 var (
 	testK8sVersion string
@@ -60,10 +61,11 @@ func TestAKSNodeClassStatusController(t *testing.T) {
 var _ = BeforeSuite(func() {
 	env = coretest.NewEnvironment(coretest.WithCRDs(apis.CRDs...), coretest.WithCRDs(v1alpha1.CRDs...), coretest.WithFieldIndexers(test.AKSNodeClassFieldIndexer(ctx)))
 	ctx = coreoptions.ToContext(ctx, coretest.Options())
-	ctx = options.ToContext(ctx, test.Options())
+	testOptions = test.Options()
+	ctx = options.ToContext(ctx, testOptions)
 	azureEnv = test.NewEnvironment(ctx, env)
 
-	controller = status.NewController(env.Client, azureEnv.KubernetesVersionProvider, azureEnv.ImageProvider, env.KubernetesInterface, azureEnv.SubnetsAPI)
+	controller = status.NewController(env.Client, azureEnv.KubernetesVersionProvider, azureEnv.ImageProvider, env.KubernetesInterface, env.KubernetesInterface, azureEnv.DynamicInterface, azureEnv.SubnetsAPI, azureEnv.DiskEncryptionSetsAPI, testOptions.ParsedDiskEncryptionSetID, options.FromContext(ctx).NetworkPolicy, options.FromContext(ctx).NetworkPlugin)
 })
 
 var _ = AfterSuite(func() {
@@ -73,7 +75,7 @@ var _ = AfterSuite(func() {
 var _ = BeforeEach(func() {
 	ctx = coreoptions.ToContext(ctx, coretest.Options())
 	nodeClass = test.AKSNodeClass()
-	azureEnv.Reset()
+	azureEnv.Reset(ctx)
 
 	testK8sVersion = lo.Must(semver.ParseTolerant(lo.Must(env.KubernetesInterface.Discovery().ServerVersion()).String())).String()
 	semverTestK8sVersion := lo.Must(semver.ParseTolerant(testK8sVersion))
