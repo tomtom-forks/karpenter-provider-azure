@@ -341,6 +341,9 @@ func (env *Environment) EventuallyExpectHealthyWithTimeout(timeout time.Duration
 	Eventually(func(g Gomega) {
 		for _, pod := range pods {
 			g.Expect(env.Client.Get(env, client.ObjectKeyFromObject(pod), pod)).To(Succeed())
+			if pod.Status.Phase == corev1.PodFailed {
+				StopTrying("pod entered terminal Failed phase, this may be due to https://github.com/Azure/karpenter-provider-azure/issues/1625").Now()
+			}
 			g.Expect(pod.Status.Conditions).To(ContainElement(And(
 				HaveField("Type", Equal(corev1.PodReady)),
 				HaveField("Status", Equal(corev1.ConditionTrue)),
@@ -500,6 +503,16 @@ func (env *Environment) EventuallyExpectHealthyPodCount(selector labels.Selector
 	return env.EventuallyExpectHealthyPodCountWithTimeout(-1, selector, numPods)
 }
 
+func (env *Environment) EventuallyExpectHealthyDeployment(deployment *appsv1.Deployment) []*corev1.Pod {
+	GinkgoHelper()
+	return env.EventuallyExpectHealthyPodCount(labels.SelectorFromSet(deployment.Spec.Selector.MatchLabels), int(*deployment.Spec.Replicas))
+}
+
+func (env *Environment) EventuallyExpectHealthyDeploymentWithTimeout(timeout time.Duration, deployment *appsv1.Deployment) []*corev1.Pod {
+	GinkgoHelper()
+	return env.EventuallyExpectHealthyPodCountWithTimeout(timeout, labels.SelectorFromSet(deployment.Spec.Selector.MatchLabels), int(*deployment.Spec.Replicas))
+}
+
 func (env *Environment) EventuallyExpectHealthyPodCountWithTimeout(timeout time.Duration, selector labels.Selector, numPods int) []*corev1.Pod {
 	GinkgoHelper()
 	var pods []*corev1.Pod
@@ -508,6 +521,19 @@ func (env *Environment) EventuallyExpectHealthyPodCountWithTimeout(timeout time.
 		g.Expect(pods).To(HaveLen(numPods))
 	}).WithTimeout(timeout).Should(Succeed())
 	return pods
+}
+
+// EventuallyExpectPVCBound waits for the PVC to reach Bound phase and returns its PV.
+func (env *Environment) EventuallyExpectPVCBound(pvc *corev1.PersistentVolumeClaim) *corev1.PersistentVolume {
+	GinkgoHelper()
+	pv := &corev1.PersistentVolume{}
+	Eventually(func(g Gomega) {
+		g.Expect(env.Client.Get(env.Context, client.ObjectKeyFromObject(pvc), pvc)).To(Succeed())
+		g.Expect(pvc.Status.Phase).To(Equal(corev1.ClaimBound))
+		g.Expect(pvc.Spec.VolumeName).ToNot(BeEmpty())
+		g.Expect(env.Client.Get(env.Context, client.ObjectKey{Name: pvc.Spec.VolumeName}, pv)).To(Succeed())
+	}).Should(Succeed())
+	return pv
 }
 
 func (env *Environment) ExpectHealthyPodCount(selector labels.Selector, numPods int) []*corev1.Pod {
@@ -641,6 +667,24 @@ func (env *Environment) ConsistentlyExpectNoDisruptions(nodeCount int, duration 
 	}, duration).Should(Succeed())
 }
 
+// ConsistentlyExpectNodesNotDisrupted asserts that the captured nodes never receive the disrupted taint.
+// Use this instead of ConsistentlyExpectNoDisruptions when the test only needs to prove that a specific
+// node set was not disrupted, since ConsistentlyExpectNoDisruptions also asserts exact Node/NodeClaim counts.
+func (env *Environment) ConsistentlyExpectNodesNotDisrupted(nodes []*corev1.Node, duration time.Duration) {
+	GinkgoHelper()
+	By(fmt.Sprintf("expecting %d nodes not to be disrupted for %s", len(nodes), duration))
+	Consistently(func(g Gomega) {
+		for _, node := range nodes {
+			current := &corev1.Node{}
+			g.Expect(env.Client.Get(env, client.ObjectKeyFromObject(node), current)).To(Succeed())
+			_, disrupted := lo.Find(current.Spec.Taints, func(taint corev1.Taint) bool {
+				return taint.MatchTaint(&karpv1.DisruptedNoScheduleTaint)
+			})
+			g.Expect(disrupted).To(BeFalse(), "expected node %s to remain undisrupted", current.Name)
+		}
+	}, duration).Should(Succeed())
+}
+
 // ConsistentlyExpectDisruptionsUntilNoneLeft consistently ensures a max on number of concurrently disrupting and non-terminating nodes.
 // This actually uses an Eventually() under the hood so that when we reach 0 tainted nodes we exit early.
 // We use the StopTrying() so that we can exit the Eventually() if we've breached an assertion on total concurrency of disruptions.
@@ -718,7 +762,7 @@ func (env *Environment) EventuallyExpectNodesUntaintedWithTimeout(timeout time.D
 
 func (env *Environment) EventuallyExpectRegisteredNodeClaimCount(comparator string, count int) []*karpv1.NodeClaim {
 	GinkgoHelper()
-	By(fmt.Sprintf("waiting for nodes to be %s to %d", comparator, count))
+	By(fmt.Sprintf("waiting for node claims to be %s to %d", comparator, count))
 	nodeClaimList := &karpv1.NodeClaimList{}
 	Eventually(func(g Gomega) {
 		g.Expect(env.Client.List(env, nodeClaimList, client.HasLabels{test.DiscoveryLabel})).To(Succeed())
@@ -728,9 +772,21 @@ func (env *Environment) EventuallyExpectRegisteredNodeClaimCount(comparator stri
 	return lo.ToSlicePtr(nodeClaimList.Items)
 }
 
+func (env *Environment) EventuallyExpectRegisteredNodeClaimCountWithSelector(comparator string, count int, selector labels.Selector) []*karpv1.NodeClaim {
+	GinkgoHelper()
+	By(fmt.Sprintf("waiting for node claims with selector %v to be %s to %d", selector, comparator, count))
+	nodeClaimList := &karpv1.NodeClaimList{}
+	Eventually(func(g Gomega) {
+		g.Expect(env.Client.List(env, nodeClaimList, client.HasLabels{test.DiscoveryLabel}, client.MatchingLabelsSelector{Selector: selector})).To(Succeed())
+		g.Expect(lo.CountBy(nodeClaimList.Items, func(nc karpv1.NodeClaim) bool { return nc.StatusConditions().IsTrue(karpv1.ConditionTypeRegistered) })).To(BeNumerically(comparator, count),
+			fmt.Sprintf("expected %d nodeclaims, had %d (%v)", count, len(nodeClaimList.Items), NodeClaimNames(lo.ToSlicePtr(nodeClaimList.Items))))
+	}).Should(Succeed())
+	return lo.ToSlicePtr(nodeClaimList.Items)
+}
+
 func (env *Environment) EventuallyExpectLaunchedNodeClaimCount(comparator string, count int) []*karpv1.NodeClaim {
 	GinkgoHelper()
-	By(fmt.Sprintf("waiting for nodes to be %s to %d", comparator, count))
+	By(fmt.Sprintf("waiting for node claims to be %s to %d", comparator, count))
 	nodeClaimList := &karpv1.NodeClaimList{}
 	Eventually(func(g Gomega) {
 		g.Expect(env.Client.List(env, nodeClaimList, client.HasLabels{test.DiscoveryLabel})).To(Succeed())
@@ -770,6 +826,21 @@ func (env *Environment) EventuallyExpectCreatedNodeCount(comparator string, coun
 	var createdNodes []*corev1.Node
 	Eventually(func(g Gomega) {
 		createdNodes = env.Monitor.CreatedNodes()
+		g.Expect(len(createdNodes)).To(BeNumerically(comparator, count),
+			fmt.Sprintf("expected %d created nodes, had %d (%v)", count, len(createdNodes), NodeNames(createdNodes)))
+	}).Should(Succeed())
+	return createdNodes
+}
+
+func (env *Environment) EventuallyExpectCreatedNodeCountWithSelector(comparator string, count int, selector labels.Selector) []*corev1.Node {
+	GinkgoHelper()
+	By(fmt.Sprintf("waiting for created nodes with selector %v to be %s to %d", selector, comparator, count))
+	var createdNodes []*corev1.Node
+	Eventually(func(g Gomega) {
+		createdNodes = env.Monitor.CreatedNodes()
+		createdNodes = lo.Filter(createdNodes, func(n *corev1.Node, _ int) bool {
+			return selector.Matches(labels.Set(n.Labels))
+		})
 		g.Expect(len(createdNodes)).To(BeNumerically(comparator, count),
 			fmt.Sprintf("expected %d created nodes, had %d (%v)", count, len(createdNodes), NodeNames(createdNodes)))
 	}).Should(Succeed())
@@ -878,10 +949,10 @@ func (env *Environment) EventuallyExpectConsolidatable(nodeClaims ...*karpv1.Nod
 	}).Should(Succeed())
 }
 
-func (env *Environment) GetNode(nodeName string) corev1.Node {
+func (env *Environment) GetNode(nodeName string) *corev1.Node {
 	GinkgoHelper()
-	var node corev1.Node
-	Expect(env.Client.Get(env.Context, types.NamespacedName{Name: nodeName}, &node)).To(Succeed())
+	node := &corev1.Node{}
+	Expect(env.Client.Get(env.Context, types.NamespacedName{Name: nodeName}, node)).To(Succeed())
 	return node
 }
 

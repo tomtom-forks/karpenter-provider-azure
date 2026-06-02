@@ -25,32 +25,44 @@ import (
 	corev1 "k8s.io/api/core/v1"
 
 	karpv1 "sigs.k8s.io/karpenter/pkg/apis/v1"
+	"sigs.k8s.io/karpenter/pkg/controllers/nodeoverlay"
 
 	"github.com/patrickmn/go-cache"
+	"k8s.io/client-go/dynamic"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	coretest "sigs.k8s.io/karpenter/pkg/test"
 
+	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/containerservice/armcontainerservice/v9"
 	"github.com/Azure/karpenter-provider-azure/pkg/auth"
 	azurecache "github.com/Azure/karpenter-provider-azure/pkg/cache"
+	"github.com/Azure/karpenter-provider-azure/pkg/consts"
 	"github.com/Azure/karpenter-provider-azure/pkg/fake"
 	"github.com/Azure/karpenter-provider-azure/pkg/operator/options"
+	"github.com/Azure/karpenter-provider-azure/pkg/providers/allocationstrategy"
+	"github.com/Azure/karpenter-provider-azure/pkg/providers/azclient"
+	"github.com/Azure/karpenter-provider-azure/pkg/providers/azclient/aksmachinesheaderbatch"
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/imagefamily"
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/instance"
+	"github.com/Azure/karpenter-provider-azure/pkg/providers/instance/machinecache"
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/instancetype"
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/kubernetesversion"
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/launchtemplate"
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/loadbalancer"
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/networksecuritygroup"
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/pricing"
+	"github.com/Azure/karpenter-provider-azure/pkg/utils/batcher"
+	"github.com/Azure/karpenter-provider-azure/pkg/utils/zones"
 )
 
 func init() {
 	karpv1.NormalizedLabels = lo.Assign(karpv1.NormalizedLabels, map[string]string{"topology.disk.csi.azure.com/zone": corev1.LabelTopologyZone})
 
-	// Configuing this here because it's commonly imported and has an init already
+	// Configuring this here because it's commonly imported and has an init already
 	gomegaformat.CharactersAroundMismatchToInclude = 40
 }
 
 const (
+	clusterName   = "test-cluster"
 	resourceGroup = "test-resourceGroup"
 	subscription  = "12345678-1234-1234-1234-123456789012"
 )
@@ -68,10 +80,19 @@ type Environment struct {
 	LoadBalancersAPI            *fake.LoadBalancersAPI
 	NetworkSecurityGroupAPI     *fake.NetworkSecurityGroupAPI
 	SubnetsAPI                  *fake.SubnetsAPI
+	DiskEncryptionSetsAPI       *fake.DiskEncryptionSetsAPI
 	AuxiliaryTokenServer        *fake.AuxiliaryTokenServer
 	SubscriptionAPI             *fake.SubscriptionsAPI
+	NodeBootstrappingAPI        *fake.NodeBootstrappingAPI
+	AKSMachinesAPI              *fake.AKSMachinesAPI
+	AKSAgentPoolsAPI            *fake.AKSAgentPoolsAPI
+	DynamicInterface            dynamic.Interface
+
+	// Fake data stores for the APIs
+	AKSDataStorage *fake.AKSDataStorage
 
 	// Cache
+	AKSMachineCache           *machinecache.MachineCache
 	KubernetesVersionCache    *cache.Cache
 	NodeImagesCache           *cache.Cache
 	InstanceTypeCache         *cache.Cache
@@ -79,8 +100,9 @@ type Environment struct {
 	UnavailableOfferingsCache *azurecache.UnavailableOfferings
 
 	// Providers
-	InstanceTypesProvider        instancetype.Provider
+	InstanceTypesProvider        *instancetype.DefaultProvider
 	VMInstanceProvider           instance.VMProvider
+	AKSMachineProvider           instance.AKSMachineProvider
 	PricingProvider              *pricing.Provider
 	KubernetesVersionProvider    kubernetesversion.KubernetesVersionProvider
 	ImageProvider                imagefamily.NodeImageProvider
@@ -88,10 +110,15 @@ type Environment struct {
 	LaunchTemplateProvider       *launchtemplate.Provider
 	LoadBalancerProvider         *loadbalancer.Provider
 	NetworkSecurityGroupProvider *networksecuritygroup.Provider
+	AllocationStrategyProvider   allocationstrategy.Provider
+
+	InstanceTypeStore *nodeoverlay.InstanceTypeStore
 
 	// Settings
 	nonZonal       bool
 	SubscriptionID string
+	coreEnv        *coretest.Environment
+	region         string
 }
 
 func NewEnvironment(ctx context.Context, env *coretest.Environment) *Environment {
@@ -127,6 +154,10 @@ func NewRegionalEnvironment(ctx context.Context, env *coretest.Environment, regi
 	nodeBootstrappingAPI := &fake.NodeBootstrappingAPI{}
 	subscriptionAPI := &fake.SubscriptionsAPI{}
 
+	aksDataStorage := fake.NewAKSDataStorage()
+	aksAgentPoolsAPI := fake.NewAKSAgentPoolsAPI(aksDataStorage)
+	aksMachinesAPI := fake.NewAKSMachinesAPI(aksDataStorage)
+
 	azureResourceGraphAPI := fake.NewAzureResourceGraphAPI(resourceGroup, virtualMachinesAPI, networkInterfacesAPI)
 	// Cache
 	kubernetesVersionCache := cache.New(azurecache.KubernetesVersionTTL, azurecache.DefaultCleanupInterval)
@@ -146,10 +177,15 @@ func NewRegionalEnvironment(ctx context.Context, env *coretest.Environment, regi
 		pricingProvider,
 		unavailableOfferingsCache)
 	imageFamilyResolver := imagefamily.NewDefaultResolver(env.Client, imageFamilyProvider, instanceTypesProvider, nodeBootstrappingAPI)
+	networkSecurityGroupProvider := networksecuritygroup.NewProvider(
+		networkSecurityGroupAPI,
+		testOptions.NodeResourceGroup,
+	)
 	launchTemplateProvider := launchtemplate.NewProvider(
 		ctx,
 		imageFamilyResolver,
 		imageFamilyProvider,
+		networkSecurityGroupProvider,
 		lo.ToPtr("ca-bundle"),
 		testOptions.ClusterEndpoint,
 		"test-tenant",
@@ -158,7 +194,6 @@ func NewRegionalEnvironment(ctx context.Context, env *coretest.Environment, regi
 		"test-kubelet-identity-client-id",
 		testOptions.NodeResourceGroup,
 		region,
-		testOptions.VnetGUID,
 		testOptions.ProvisionMode,
 	)
 	loadBalancerProvider := loadbalancer.NewProvider(
@@ -166,17 +201,29 @@ func NewRegionalEnvironment(ctx context.Context, env *coretest.Environment, regi
 		loadBalancerCache,
 		testOptions.NodeResourceGroup,
 	)
-	networkSecurityGroupProvider := networksecuritygroup.NewProvider(
-		networkSecurityGroupAPI,
-		testOptions.NodeResourceGroup,
-	)
 	subnetsAPI := &fake.SubnetsAPI{}
-	azClient := instance.NewAZClientFromAPI(
+	diskEncryptionSetsAPI := &fake.DiskEncryptionSetsAPI{}
+
+	// Set up batching if provision mode is header batch
+	var aksMachinesBatchAPI aksmachinesheaderbatch.AKSMachinesHeaderBatchAPI
+	if testOptions.ProvisionMode == consts.ProvisionModeAKSMachineAPIHeaderBatch {
+		aksMachinesBatchAPI = aksmachinesheaderbatch.NewClient(ctx, aksMachinesAPI, batcher.Options{
+			IdleTimeout:  time.Duration(testOptions.BatchIdleTimeoutMS) * time.Millisecond,
+			MaxTimeout:   time.Duration(testOptions.BatchMaxTimeoutMS) * time.Millisecond,
+			MaxBatchSize: testOptions.MaxBatchSize,
+		})
+	}
+
+	azClient := azclient.NewAZClientFromAPI(
 		virtualMachinesAPI,
 		azureResourceGraphAPI,
+		aksMachinesAPI,
+		aksMachinesBatchAPI,
+		aksAgentPoolsAPI,
 		virtualMachinesExtensionsAPI,
 		networkInterfacesAPI,
 		subnetsAPI,
+		diskEncryptionSetsAPI,
 		loadBalancersAPI,
 		networkSecurityGroupAPI,
 		communityImageVersionsAPI,
@@ -185,9 +232,11 @@ func NewRegionalEnvironment(ctx context.Context, env *coretest.Environment, regi
 		skusAPI,
 		subscriptionAPI,
 	)
+	allocationStrategyProvider := allocationstrategy.NewProvider()
 	vmInstanceProvider := instance.NewDefaultVMProvider(
 		azClient,
 		instanceTypesProvider,
+		allocationStrategyProvider,
 		launchTemplateProvider,
 		loadBalancerProvider,
 		networkSecurityGroupProvider,
@@ -197,7 +246,58 @@ func NewRegionalEnvironment(ctx context.Context, env *coretest.Environment, regi
 		subscription,
 		testOptions.ProvisionMode,
 		testOptions.DiskEncryptionSetID,
+		azureEnv,
 	)
+
+	if testOptions.IsAKSMachineAPIMode() && testOptions.AKSMachinesPoolName != "" {
+		// For this configuration, we assume the AKS machines pool already exists
+		aksDataStorage.AgentPools.Store(
+			fake.MkAgentPoolID(testOptions.NodeResourceGroup, clusterName, testOptions.AKSMachinesPoolName),
+			armcontainerservice.AgentPool{
+				Name: lo.ToPtr(testOptions.AKSMachinesPoolName),
+				Properties: &armcontainerservice.ManagedClusterAgentPoolProfileProperties{
+					Mode: lo.ToPtr(armcontainerservice.AgentPoolModeMachines),
+				},
+			},
+		)
+	}
+
+	batchCreationEnabled := testOptions.ProvisionMode == consts.ProvisionModeAKSMachineAPIHeaderBatch
+
+	aksMachineCache := machinecache.New(
+		ctx,
+		azClient.AKSMachinesClient(),
+		testOptions.NodeResourceGroup,
+		clusterName,
+		testOptions.AKSMachinesPoolName,
+		machinecache.WithTTL(1*time.Second),
+		machinecache.WithPollInterval(1*time.Millisecond),
+	)
+
+	aksMachineInstanceProvider := instance.NewAKSMachineProvider(
+		azClient,
+		instanceTypesProvider,
+		allocationStrategyProvider,
+		imageFamilyResolver,
+		unavailableOfferingsCache,
+		subscription,
+		testOptions.NodeResourceGroup,
+		clusterName,
+		testOptions.AKSMachinesPoolName,
+		region,
+		batchCreationEnabled,
+		aksMachineCache,
+	)
+
+	store := nodeoverlay.NewInstanceTypeStore()
+
+	// Populate the instance type cache before returning the environment, as many tests assume it's populated and it simplifies test setup.
+	// We can update it in individual tests as needed.
+	lo.Must0(instanceTypesProvider.UpdateInstanceTypes(ctx))
+
+	// Seed the managed NSG
+	nsg := MakeNetworkSecurityGroup(testOptions.NodeResourceGroup, "aks-agentpool-00000000-nsg")
+	networkSecurityGroupAPI.NSGs.Store(lo.FromPtr(nsg.ID), nsg)
 
 	return &Environment{
 		VirtualMachinesAPI:          virtualMachinesAPI,
@@ -210,10 +310,18 @@ func NewRegionalEnvironment(ctx context.Context, env *coretest.Environment, regi
 		LoadBalancersAPI:            loadBalancersAPI,
 		NetworkSecurityGroupAPI:     networkSecurityGroupAPI,
 		SubnetsAPI:                  subnetsAPI,
+		DiskEncryptionSetsAPI:       diskEncryptionSetsAPI,
 		SKUsAPI:                     skusAPI,
 		PricingAPI:                  pricingAPI,
 		SubscriptionAPI:             subscriptionAPI,
+		NodeBootstrappingAPI:        nodeBootstrappingAPI,
+		AKSMachinesAPI:              aksMachinesAPI,
+		AKSAgentPoolsAPI:            aksAgentPoolsAPI,
+		DynamicInterface:            dynamic.NewForConfigOrDie(env.Config),
 
+		AKSDataStorage: aksDataStorage,
+
+		AKSMachineCache:           aksMachineCache,
 		KubernetesVersionCache:    kubernetesVersionCache,
 		NodeImagesCache:           nodeImagesCache,
 		InstanceTypeCache:         instanceTypeCache,
@@ -222,6 +330,7 @@ func NewRegionalEnvironment(ctx context.Context, env *coretest.Environment, regi
 
 		InstanceTypesProvider:        instanceTypesProvider,
 		VMInstanceProvider:           vmInstanceProvider,
+		AKSMachineProvider:           aksMachineInstanceProvider,
 		PricingProvider:              pricingProvider,
 		KubernetesVersionProvider:    kubernetesVersionProvider,
 		ImageProvider:                imageFamilyProvider,
@@ -229,13 +338,18 @@ func NewRegionalEnvironment(ctx context.Context, env *coretest.Environment, regi
 		LaunchTemplateProvider:       launchTemplateProvider,
 		LoadBalancerProvider:         loadBalancerProvider,
 		NetworkSecurityGroupProvider: networkSecurityGroupProvider,
+		AllocationStrategyProvider:   allocationStrategyProvider,
+
+		InstanceTypeStore: store,
 
 		nonZonal:       nonZonal,
 		SubscriptionID: subscription,
+		region:         region,
+		coreEnv:        env,
 	}
 }
 
-func (env *Environment) Reset() {
+func (env *Environment) Reset(ctx context.Context) {
 	env.VirtualMachinesAPI.Reset()
 	if env.AuxiliaryTokenServer != nil {
 		env.AuxiliaryTokenServer.Reset()
@@ -248,21 +362,35 @@ func (env *Environment) Reset() {
 	env.SubnetsAPI.Reset()
 	env.CommunityImageVersionsAPI.Reset()
 	env.NodeImageVersionsAPI.Reset()
+	env.NodeBootstrappingAPI.Reset()
 	env.SKUsAPI.Reset()
 	env.PricingAPI.Reset()
 	env.PricingProvider.Reset()
+	env.AKSMachinesAPI.Reset()
+	env.AKSAgentPoolsAPI.Reset()
 
 	env.KubernetesVersionCache.Flush()
 	env.NodeImagesCache.Flush()
 	env.InstanceTypeCache.Flush()
 	env.UnavailableOfferingsCache.Flush()
+	env.AKSMachineCache.InvalidateAll()
 	env.LoadBalancerCache.Flush()
+
+	// Re-seed the managed NSG so launchtemplate provider can resolve it
+	nodeResourceGroup := options.FromContext(ctx).NodeResourceGroup
+	nsg := MakeNetworkSecurityGroup(nodeResourceGroup, "aks-agentpool-00000000-nsg")
+	env.NetworkSecurityGroupAPI.NSGs.Store(lo.FromPtr(nsg.ID), nsg)
 }
 
 func (env *Environment) Zones() []string {
 	if env.nonZonal {
-		return []string{""}
+		return []string{zones.Regional}
 	} else {
 		return []string{fake.Region + "-1", fake.Region + "-2", fake.Region + "-3"}
 	}
+}
+
+// Client returns the controller-runtime client from the underlying core test environment.
+func (env *Environment) Client() client.Client {
+	return env.coreEnv.Client
 }

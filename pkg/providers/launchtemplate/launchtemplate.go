@@ -18,15 +18,14 @@ package launchtemplate
 
 import (
 	"context"
-	"sigs.k8s.io/controller-runtime/pkg/log"
-	"strconv"
-	"strings"
+	"fmt"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/compute/armcompute/v7"
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/imagefamily"
+	karplabels "github.com/Azure/karpenter-provider-azure/pkg/providers/labels"
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/launchtemplate/parameters"
+	"github.com/Azure/karpenter-provider-azure/pkg/providers/networksecuritygroup"
 	"github.com/Azure/karpenter-provider-azure/pkg/utils"
-	"github.com/blang/semver/v4"
 	"github.com/samber/lo"
 	v1 "k8s.io/api/core/v1"
 
@@ -35,18 +34,12 @@ import (
 	"github.com/Azure/karpenter-provider-azure/pkg/operator/options"
 	karpv1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
+
 	"sigs.k8s.io/karpenter/pkg/scheduling"
 )
 
-var (
-	dataplaneLabel           = v1beta1.AKSLabelDomain + "/ebpf-dataplane"
-	azureCNIOverlayLabel     = v1beta1.AKSLabelDomain + "/azure-cni-overlay"
-	subnetNameLabel          = v1beta1.AKSLabelDomain + "/network-subnet"
-	vnetGUIDLabel            = v1beta1.AKSLabelDomain + "/nodenetwork-vnetguid"
-	podNetworkTypeLabel      = v1beta1.AKSLabelDomain + "/podnetwork-type"
-	networkStatelessCNILabel = v1beta1.AKSLabelDomain + "/network-stateless-cni"
-)
-
+// ATTENTION!!!: changes here may NOT be effective on AKS machine nodes (ProvisionModeAKSMachineAPI); See aksmachineinstance.go/aksmachineinstancehelpers.go.
+// Refactoring for code unification is not being invested immediately.
 type Template struct {
 	ScriptlessCustomData      string
 	ImageID                   string
@@ -64,6 +57,7 @@ type Template struct {
 type Provider struct {
 	imageFamily             imagefamily.Resolver
 	imageProvider           imagefamily.NodeImageProvider
+	nsgProvider             *networksecuritygroup.Provider
 	caBundle                *string
 	clusterEndpoint         string
 	tenantID                string
@@ -72,18 +66,32 @@ type Provider struct {
 	resourceGroup           string
 	clusterResourceGroup    string
 	location                string
-	vnetGUID                string
 	provisionMode           string
 }
 
 // TODO: add caching of launch templates
 
-func NewProvider(_ context.Context, imageFamily imagefamily.Resolver, imageProvider imagefamily.NodeImageProvider, caBundle *string, clusterEndpoint string,
-	tenantID, subscriptionID, clusterResourceGroup string, kubeletIdentityClientID, resourceGroup, location, vnetGUID, provisionMode string,
+// ATTENTION!!!: changes here may NOT be effective on AKS machine nodes (ProvisionModeAKSMachineAPI); See aksmachineinstance.go/aksmachineinstancehelpers.go.
+// Refactoring for code unification is not being invested immediately.
+func NewProvider(
+	_ context.Context,
+	imageFamily imagefamily.Resolver,
+	imageProvider imagefamily.NodeImageProvider,
+	nsgProvider *networksecuritygroup.Provider,
+	caBundle *string,
+	clusterEndpoint string,
+	tenantID,
+	subscriptionID,
+	clusterResourceGroup string,
+	kubeletIdentityClientID,
+	resourceGroup,
+	location,
+	provisionMode string,
 ) *Provider {
 	return &Provider{
 		imageFamily:             imageFamily,
 		imageProvider:           imageProvider,
+		nsgProvider:             nsgProvider,
 		caBundle:                caBundle,
 		clusterEndpoint:         clusterEndpoint,
 		tenantID:                tenantID,
@@ -92,11 +100,12 @@ func NewProvider(_ context.Context, imageFamily imagefamily.Resolver, imageProvi
 		resourceGroup:           resourceGroup,
 		clusterResourceGroup:    clusterResourceGroup,
 		location:                location,
-		vnetGUID:                vnetGUID,
 		provisionMode:           provisionMode,
 	}
 }
 
+// ATTENTION!!!: changes here may NOT be effective on AKS machine nodes (ProvisionModeAKSMachineAPI); See aksmachineinstance.go/aksmachineinstancehelpers.go.
+// Refactoring for code unification is not being invested immediately.
 func (p *Provider) GetTemplate(
 	ctx context.Context,
 	nodeClass *v1beta1.AKSNodeClass,
@@ -129,42 +138,41 @@ func (p *Provider) GetTemplate(
 	return launchTemplate, nil
 }
 
+// ATTENTION!!!: changes here may NOT be effective on AKS machine nodes (ProvisionModeAKSMachineAPI); See aksmachineinstance.go/aksmachineinstancehelpers.go.
+// Refactoring for code unification is not being invested immediately.
 func (p *Provider) getStaticParameters(
 	ctx context.Context,
 	instanceType *cloudprovider.InstanceType,
 	nodeClass *v1beta1.AKSNodeClass,
 	labels map[string]string,
 ) (*parameters.StaticParameters, error) {
-	var arch string = karpv1.ArchitectureAmd64
+	var arch = karpv1.ArchitectureAmd64
 	if err := instanceType.Requirements.Compatible(scheduling.NewRequirements(scheduling.NewRequirement(v1.LabelArchStable, v1.NodeSelectorOpIn, karpv1.ArchitectureArm64))); err == nil {
 		arch = karpv1.ArchitectureArm64
 	}
 
 	subnetID := lo.Ternary(nodeClass.Spec.VNETSubnetID != nil, lo.FromPtr(nodeClass.Spec.VNETSubnetID), options.FromContext(ctx).SubnetID)
-
-	if isAzureCNIOverlay(ctx) {
-		// TODO: make conditional on pod subnet
-		kubernetesVersion, err := nodeClass.GetKubernetesVersion()
-		if err != nil {
-			return nil, err
-		}
-		vnetLabels, err := p.getVnetInfoLabels(subnetID, kubernetesVersion)
-		if err != nil {
-			return nil, err
-		}
-		labels = lo.Assign(labels, vnetLabels)
+	baseLabels, err := karplabels.Get(ctx, nodeClass, arch)
+	if err != nil {
+		return nil, err
 	}
+	labels = lo.Assign(baseLabels, labels)
 
-	if options.FromContext(ctx).NetworkDataplane == consts.NetworkDataplaneCilium {
-		// This label is required for the cilium agent daemonset because
-		// we select the nodes for the daemonset based on this label
-		//              - key: kubernetes.azure.com/ebpf-dataplane
-		//            operator: In
-		//            values:
-		//              - cilium
+	// Remove labels kubelet can't set (e.g. kubernetes.io/*, k8s.io/* outside allowed namespaces)
+	labels = lo.OmitBy(labels, func(key string, _ string) bool {
+		return !karplabels.CanKubeletSetLabel(key)
+	})
 
-		labels[dataplaneLabel] = consts.NetworkDataplaneCilium
+	// ATTENTION!!!: changes here will NOT be effective on AKS machine nodes (ProvisionModeAKSMachineAPI); See aksmachineinstance.go/aksmachineinstancehelpers.go.
+	// Refactoring for code unification is not being invested immediately.
+
+	nsg, err := p.nsgProvider.ManagedNetworkSecurityGroup(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("getting managed network security group: %w", err)
 	}
+	nsgName := lo.FromPtr(nsg.Name)
+	clusterID := networksecuritygroup.GetClusterIDFromNSGName(nsgName)
+	routeTableName := fmt.Sprintf("aks-agentpool-%s-routetable", clusterID)
 
 	return &parameters.StaticParameters{
 		ClusterName:                    options.FromContext(ctx).ClusterName,
@@ -176,12 +184,14 @@ func (p *Provider) getStaticParameters(
 		GPUDriverVersion:               utils.GetGPUDriverVersion(instanceType.Name),
 		GPUDriverType:                  utils.GetGPUDriverType(instanceType.Name),
 		GPUImageSHA:                    utils.GetAKSGPUImageSHA(instanceType.Name),
+		GPUDriverInstallationEnabled:   nodeClass.IsGPUDriverInstallationEnabled(),
 		TenantID:                       p.tenantID,
 		SubscriptionID:                 p.subscriptionID,
 		KubeletIdentityClientID:        p.kubeletIdentityClientID,
 		ResourceGroup:                  p.resourceGroup,
 		Location:                       p.location,
-		ClusterID:                      options.FromContext(ctx).ClusterID,
+		NetworkSecurityGroupName:       nsgName,
+		RouteTableName:                 routeTableName,
 		APIServerName:                  options.FromContext(ctx).GetAPIServerName(),
 		KubeletClientTLSBootstrapToken: options.FromContext(ctx).KubeletClientTLSBootstrapToken,
 		NetworkPlugin:                  getAgentbakerNetworkPlugin(ctx),
@@ -192,24 +202,15 @@ func (p *Provider) getStaticParameters(
 }
 
 func getAgentbakerNetworkPlugin(ctx context.Context) string {
-	if isAzureCNIOverlay(ctx) || isCiliumNodeSubnet(ctx) || isNetworkPluginNone(ctx) {
+	opts := options.FromContext(ctx)
+	if opts.IsAzureCNIOverlay() || opts.IsCiliumNodeSubnet() || opts.IsNetworkPluginNone() {
 		return consts.NetworkPluginNone
 	}
 	return consts.NetworkPluginAzure
 }
 
-func isNetworkPluginNone(ctx context.Context) bool {
-	return options.FromContext(ctx).NetworkPlugin == consts.NetworkPluginNone
-}
-
-func isCiliumNodeSubnet(ctx context.Context) bool {
-	return options.FromContext(ctx).NetworkPlugin == consts.NetworkPluginAzure && options.FromContext(ctx).NetworkPluginMode == consts.NetworkPluginModeNone && options.FromContext(ctx).NetworkDataplane == consts.NetworkDataplaneCilium
-}
-
-func isAzureCNIOverlay(ctx context.Context) bool {
-	return options.FromContext(ctx).NetworkPlugin == consts.NetworkPluginAzure && options.FromContext(ctx).NetworkPluginMode == consts.NetworkPluginModeOverlay
-}
-
+// ATTENTION!!!: changes here may NOT be effective on AKS machine nodes (ProvisionModeAKSMachineAPI); See aksmachineinstance.go/aksmachineinstancehelpers.go.
+// Refactoring for code unification is not being invested immediately.
 func (p *Provider) createLaunchTemplate(ctx context.Context, params *parameters.Parameters) (*Template, error) {
 	template := &Template{
 		ImageID:                   params.ImageID,
@@ -221,14 +222,15 @@ func (p *Provider) createLaunchTemplate(ctx context.Context, params *parameters.
 		StorageProfileSizeGB:      params.StorageProfileSizeGB,
 	}
 
-	if p.provisionMode == consts.ProvisionModeBootstrappingClient {
+	switch p.provisionMode {
+	case consts.ProvisionModeBootstrappingClient:
 		customData, cse, err := params.CustomScriptsNodeBootstrapping.GetCustomDataAndCSE(ctx)
 		if err != nil {
 			return nil, err
 		}
 		template.CustomScriptsCustomData = customData
 		template.CustomScriptsCSE = cse
-	} else {
+	case consts.ProvisionModeAKSScriptless:
 		// render user data
 		userData, err := params.ScriptlessCustomData.Script()
 		if err != nil {
@@ -238,26 +240,4 @@ func (p *Provider) createLaunchTemplate(ctx context.Context, params *parameters.
 	}
 
 	return template, nil
-}
-
-func (p *Provider) getVnetInfoLabels(subnetID string, kubernetesVersion string) (map[string]string, error) {
-	vnetSubnetComponents, err := utils.GetVnetSubnetIDComponents(subnetID)
-	if err != nil {
-		return nil, err
-	}
-	vnetLabels := map[string]string{
-		subnetNameLabel:      vnetSubnetComponents.SubnetName,
-		vnetGUIDLabel:        p.vnetGUID,
-		azureCNIOverlayLabel: strconv.FormatBool(true),
-		podNetworkTypeLabel:  consts.NetworkPluginModeOverlay,
-	}
-
-	parsedVersion, err := semver.ParseTolerant(strings.TrimPrefix(kubernetesVersion, "v"))
-	// Sanity Check: in production we should always have a k8s version set
-	if err != nil {
-		return nil, err
-	}
-	vnetLabels[networkStatelessCNILabel] = lo.Ternary(parsedVersion.GE(semver.Version{Major: 1, Minor: 34}), "true", "false")
-
-	return vnetLabels, nil
 }

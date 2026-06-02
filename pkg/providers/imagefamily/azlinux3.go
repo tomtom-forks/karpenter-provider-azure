@@ -45,7 +45,7 @@ type AzureLinux3 struct {
 }
 
 func (u AzureLinux3) Name() string {
-	return v1beta1.AzureLinuxImageFamily
+	return "AzureLinux3"
 }
 
 func (u AzureLinux3) DefaultImages(useSIG bool, fipsMode *v1beta1.FIPSMode) []types.DefaultImageOutput {
@@ -92,7 +92,7 @@ func (u AzureLinux3) DefaultImages(useSIG bool, fipsMode *v1beta1.FIPSMode) []ty
 		}
 	}
 	// image provider will select these images in order, first match wins
-	images := []types.DefaultImageOutput{
+	return []types.DefaultImageOutput{
 		{
 			PublicGalleryURL:     AKSAzureLinuxPublicGalleryURL,
 			GalleryResourceGroup: AKSAzureLinuxResourceGroup,
@@ -115,11 +115,7 @@ func (u AzureLinux3) DefaultImages(useSIG bool, fipsMode *v1beta1.FIPSMode) []ty
 			),
 			Distro: "aks-azurelinux-v3",
 		},
-	}
-
-	if useSIG {
-		// AzLinux3 ARM64 VHD is not available in CIG right now
-		images = append(images, types.DefaultImageOutput{
+		{
 			PublicGalleryURL:     AKSAzureLinuxPublicGalleryURL,
 			GalleryResourceGroup: AKSAzureLinuxResourceGroup,
 			GalleryName:          AKSAzureLinuxGalleryName,
@@ -129,10 +125,8 @@ func (u AzureLinux3) DefaultImages(useSIG bool, fipsMode *v1beta1.FIPSMode) []ty
 				scheduling.NewRequirement(v1beta1.LabelSKUHyperVGeneration, v1.NodeSelectorOpIn, v1beta1.HyperVGenerationV2),
 			),
 			Distro: "aks-azurelinux-v3-arm64-gen2",
-		})
+		},
 	}
-
-	return images
 }
 
 // UserData returns the default userdata script for the image Family
@@ -145,17 +139,18 @@ func (u AzureLinux3) ScriptlessCustomData(
 ) bootstrap.Bootstrapper {
 	return bootstrap.AKS{
 		Options: bootstrap.Options{
-			ClusterName:      u.Options.ClusterName,
-			ClusterEndpoint:  u.Options.ClusterEndpoint,
-			KubeletConfig:    kubeletConfig,
-			Taints:           taints,
-			Labels:           labels,
-			CABundle:         caBundle,
-			GPUNode:          u.Options.GPUNode,
-			GPUDriverVersion: u.Options.GPUDriverVersion,
-			GPUDriverType:    u.Options.GPUDriverType,
-			GPUImageSHA:      u.Options.GPUImageSHA,
-			SubnetID:         u.Options.SubnetID,
+			ClusterName:                  u.Options.ClusterName,
+			ClusterEndpoint:              u.Options.ClusterEndpoint,
+			KubeletConfig:                kubeletConfig,
+			Taints:                       taints,
+			Labels:                       labels,
+			CABundle:                     caBundle,
+			GPUNode:                      u.Options.GPUNode,
+			GPUDriverVersion:             u.Options.GPUDriverVersion,
+			GPUDriverType:                u.Options.GPUDriverType,
+			GPUImageSHA:                  u.Options.GPUImageSHA,
+			GPUDriverInstallationEnabled: u.Options.GPUDriverInstallationEnabled,
+			SubnetID:                     u.Options.SubnetID,
 		},
 		Arch:                           u.Options.Arch,
 		TenantID:                       u.Options.TenantID,
@@ -163,7 +158,8 @@ func (u AzureLinux3) ScriptlessCustomData(
 		Location:                       u.Options.Location,
 		KubeletIdentityClientID:        u.Options.KubeletIdentityClientID,
 		ResourceGroup:                  u.Options.ResourceGroup,
-		ClusterID:                      u.Options.ClusterID,
+		NetworkSecurityGroupName:       u.Options.NetworkSecurityGroupName,
+		RouteTableName:                 u.Options.RouteTableName,
 		APIServerName:                  u.Options.APIServerName,
 		KubeletClientTLSBootstrapToken: u.Options.KubeletClientTLSBootstrapToken,
 		NetworkPlugin:                  u.Options.NetworkPlugin,
@@ -183,6 +179,9 @@ func (u AzureLinux3) CustomScriptsNodeBootstrapping(
 	storageProfile string,
 	nodeBootstrappingClient types.NodeBootstrappingAPI,
 	fipsMode *v1beta1.FIPSMode,
+	localDNS *v1beta1.LocalDNS,
+	artifactStreaming *v1beta1.ArtifactStreaming,
+	linuxOSConfig *v1beta1.LinuxOSConfiguration,
 ) customscriptsbootstrap.Bootstrapper {
 	return customscriptsbootstrap.ProvisionClientBootstrap{
 		ClusterName:                    u.Options.ClusterName,
@@ -200,8 +199,12 @@ func (u AzureLinux3) CustomScriptsNodeBootstrapping(
 		InstanceType:                   instanceType,
 		StorageProfile:                 storageProfile,
 		ClusterResourceGroup:           u.Options.ClusterResourceGroup,
+		GPUDriverInstallationEnabled:   u.Options.GPUDriverInstallationEnabled,
 		NodeBootstrappingProvider:      nodeBootstrappingClient,
 		OSSKU:                          customscriptsbootstrap.ImageFamilyOSSKUAzureLinux3,
 		FIPSMode:                       fipsMode,
+		LocalDNSProfile:                localDNS,
+		ArtifactStreaming:              artifactStreaming,
+		LinuxOSConfig:                  linuxOSConfig,
 	}
 }

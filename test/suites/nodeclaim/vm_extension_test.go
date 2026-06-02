@@ -17,6 +17,7 @@ limitations under the License.
 package nodeclaim_test
 
 import (
+	"github.com/Azure/karpenter-provider-azure/pkg/providers/launchtemplate"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	"github.com/samber/lo"
@@ -26,12 +27,23 @@ import (
 
 var _ = Describe("VMExtension", func() {
 	It("should install all valid vm extensions", func() {
-		pod := test.Pod()
-		env.ExpectCreated(nodeClass, nodePool, pod)
-		env.EventuallyExpectHealthy(pod)
+		deployment := test.Deployment(test.DeploymentOptions{Replicas: 1})
+		env.ExpectCreated(nodeClass, nodePool, deployment)
+		pods := env.EventuallyExpectHealthyDeployment(deployment)
 		env.ExpectCreatedNodeCount("==", 1)
 
-		vm := env.GetVM(pod.Spec.NodeName)
+		vm := env.GetVM(pods[0].Spec.NodeName)
+
+		// Skip validation for AKS machine VMs (managed by AKS, not Karpenter directly).
+		// The presence of "karpenter.azure.com_aksmachine_nodeclaim" tag indicates this is an AKS machine.
+		// Extensions on these VMs are managed by AKS and could change beyond Karpenter's control.
+		// The coverage of this case should be handled by other E2Es (e.g., CSE not present would have failed all tests, detailed extension expectations should be tested server-side)
+		if vm.Tags != nil {
+			if _, isAKSMachine := vm.Tags[launchtemplate.KarpenterAKSMachineNodeClaimTagKey]; isAKSMachine {
+				Skip("Skipping VM extension validation for AKS machine VMs (extensions are managed by AKS)")
+			}
+		}
+
 		installedExtensions := []string{}
 		for _, ext := range vm.Resources {
 			installedExtensions = append(installedExtensions, lo.FromPtr(ext.Name))

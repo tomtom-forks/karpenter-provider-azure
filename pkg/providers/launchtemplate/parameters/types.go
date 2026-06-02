@@ -22,6 +22,8 @@ import (
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/imagefamily/customscriptsbootstrap"
 )
 
+// ATTENTION!!!: changes here may NOT be effective on AKS machine nodes (ProvisionModeAKSMachineAPI); See aksmachineinstance.go/aksmachineinstancehelpers.go.
+// Refactoring for code unification is not being invested immediately.
 // StaticParameters define the static launch template parameters
 type StaticParameters struct {
 	ClusterName                    string
@@ -32,12 +34,14 @@ type StaticParameters struct {
 	GPUDriverVersion               string
 	GPUDriverType                  string
 	GPUImageSHA                    string
+	GPUDriverInstallationEnabled   bool
 	TenantID                       string
 	SubscriptionID                 string
 	KubeletIdentityClientID        string
 	Location                       string
 	ResourceGroup                  string
-	ClusterID                      string
+	NetworkSecurityGroupName       string
+	RouteTableName                 string
 	APIServerName                  string
 	KubeletClientTLSBootstrapToken string
 	NetworkPlugin                  string
@@ -49,6 +53,8 @@ type StaticParameters struct {
 	Labels map[string]string
 }
 
+// ATTENTION!!!: changes here may NOT be effective on AKS machine nodes (ProvisionModeAKSMachineAPI); See aksmachineinstance.go/aksmachineinstancehelpers.go.
+// Refactoring for code unification is not being invested immediately.
 // Parameters adds the dynamically generated launch template parameters
 type Parameters struct {
 	*StaticParameters

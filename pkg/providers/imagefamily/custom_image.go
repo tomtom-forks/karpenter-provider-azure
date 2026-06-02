@@ -116,7 +116,6 @@ func (u CustomImages) ScriptlessCustomData(
 		Location:                       u.Options.Location,
 		KubeletIdentityClientID:        u.Options.KubeletIdentityClientID,
 		ResourceGroup:                  u.Options.ResourceGroup,
-		ClusterID:                      u.Options.ClusterID,
 		APIServerName:                  u.Options.APIServerName,
 		KubeletClientTLSBootstrapToken: u.Options.KubeletClientTLSBootstrapToken,
 		NetworkPlugin:                  u.Options.NetworkPlugin,
@@ -136,6 +135,9 @@ func (u CustomImages) CustomScriptsNodeBootstrapping(
 	storageProfile string,
 	nodeBootstrappingClient types.NodeBootstrappingAPI,
 	fipsMode *v1beta1.FIPSMode,
+	_ *v1beta1.LocalDNS,
+	_ *v1beta1.ArtifactStreaming,
+	_ *v1beta1.LinuxOSConfiguration,
 ) customscriptsbootstrap.Bootstrapper {
 	return customscriptsbootstrap.ProvisionClientBootstrap{
 		ClusterName:                    u.Options.ClusterName,
