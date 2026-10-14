@@ -38,7 +38,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/karpenter/pkg/metrics"
 
-	//nolint:SA1019 // deprecated package
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/compute/armcompute/v7"
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/containerservice/armcontainerservice/v9"
 
@@ -74,6 +73,7 @@ const (
 	NodeClassReadinessUnknownReason    = "NodeClassReadinessUnknown"
 	InstanceTypeResolutionFailedReason = "InstanceTypeResolutionFailed"
 	CreateInstanceFailedReason         = "CreateInstanceFailed"
+	SpotConditionPreemptionScheduled   = "PreemptionScheduled"
 )
 
 var _ cloudprovider.CloudProvider = (*CloudProvider)(nil)
@@ -114,7 +114,10 @@ func (c *CloudProvider) WaitForInstancePromises() {
 	c.instancePromiseWg.Wait()
 }
 
-func (c *CloudProvider) validateNodeClass(nodeClass *v1beta1.AKSNodeClass) error {
+func (c *CloudProvider) validateNodeClass(ctx context.Context, nodeClass *v1beta1.AKSNodeClass) error {
+	if options.FromContext(ctx).EnableFIPS && lo.FromPtr(nodeClass.Spec.FIPSMode) != v1beta1.FIPSModeFIPS {
+		return cloudprovider.NewNodeClassNotReadyError(stderrors.New("AKSNodeClass spec.fipsMode must be set to FIPS because FIPS is enabled at the cluster level"))
+	}
 	nodeClassReady := nodeClass.StatusConditions().Get(status.ConditionReady)
 	if nodeClassReady.IsFalse() {
 		return cloudprovider.NewNodeClassNotReadyError(stderrors.New(nodeClassReady.Message))
@@ -152,7 +155,7 @@ func (c *CloudProvider) Create(ctx context.Context, nodeClaim *karpv1.NodeClaim)
 			return nil, err
 		}
 	*/
-	if err = c.validateNodeClass(nodeClass); err != nil {
+	if err = c.validateNodeClass(ctx, nodeClass); err != nil {
 		return nil, err
 	}
 
@@ -176,7 +179,7 @@ func (c *CloudProvider) Create(ctx context.Context, nodeClaim *karpv1.NodeClaim)
 func (c *CloudProvider) createVMInstance(ctx context.Context, nodeClass *v1beta1.AKSNodeClass, nodeClaim *karpv1.NodeClaim, instanceTypes []*cloudprovider.InstanceType) (*karpv1.NodeClaim, error) {
 	vmPromise, err := c.vmInstanceProvider.BeginCreate(ctx, nodeClass, nodeClaim, instanceTypes)
 	if err != nil {
-		return nil, cloudprovider.NewCreateError(fmt.Errorf("creating instance failed, %w", err), CreateInstanceFailedReason, truncateMessage(err.Error()))
+		return nil, toCreateError(err, "creating instance failed")
 	}
 
 	if err := c.handleInstancePromise(ctx, vmPromise, nodeClaim); err != nil {
@@ -210,7 +213,7 @@ func (c *CloudProvider) createAKSMachineInstance(ctx context.Context, nodeClass 
 	// Begin the creation of the instance
 	aksMachinePromise, err := c.aksMachineInstanceProvider.BeginCreate(ctx, nodeClass, nodeClaim, instanceTypes)
 	if err != nil {
-		return nil, cloudprovider.NewCreateError(fmt.Errorf("creating AKS machine failed, %w", err), CreateInstanceFailedReason, truncateMessage(err.Error()))
+		return nil, toCreateError(err, "creating AKS machine failed")
 	}
 
 	// Handle the promise
@@ -258,7 +261,7 @@ func (c *CloudProvider) handleInstancePromise(ctx context.Context, instancePromi
 		err := instancePromise.Wait()
 		if err != nil {
 			c.handleInstancePromiseWaitError(ctx, instancePromise, nodeClaim, err)
-			return cloudprovider.NewCreateError(fmt.Errorf("creating standalone instance failed, %w", err), CreateInstanceFailedReason, truncateMessage(err.Error()))
+			return toCreateError(err, "creating standalone instance failed")
 		}
 	}
 	// For NodePool-managed nodeclaims, launch a single goroutine to poll the returned promise.
@@ -365,10 +368,40 @@ func (c *CloudProvider) waitUntilLaunched(ctx context.Context, nodeClaim *karpv1
 }
 
 func (c *CloudProvider) List(ctx context.Context) ([]*karpv1.NodeClaim, error) {
+	return c.list(ctx)
+}
+
+type listOptions struct {
+	includeAKSMachineVMState bool
+}
+
+type listOption func(*listOptions)
+
+func withAKSMachineVMState() listOption {
+	return func(options *listOptions) {
+		options.includeAKSMachineVMState = true
+	}
+}
+
+// ListWithAKSMachineVMState lists cloud instances while requesting the VM state field for AKS Machines.
+func (c *CloudProvider) ListWithAKSMachineVMState(ctx context.Context) ([]*karpv1.NodeClaim, error) {
+	return c.list(ctx, withAKSMachineVMState())
+}
+
+func (c *CloudProvider) list(ctx context.Context, opts ...listOption) ([]*karpv1.NodeClaim, error) {
+	options := &listOptions{}
+	for _, opt := range opts {
+		opt(options)
+	}
+
 	var nodeClaims []*karpv1.NodeClaim
 
 	// List AKS machine-based nodes
-	aksMachineInstances, err := c.aksMachineInstanceProvider.List(ctx)
+	var aksMachineOptions []instance.Option
+	if options.includeAKSMachineVMState {
+		aksMachineOptions = append(aksMachineOptions, instance.WithMachineVMStateExpansion())
+	}
+	aksMachineInstances, err := c.aksMachineInstanceProvider.List(ctx, aksMachineOptions...)
 	if err != nil {
 		return nil, fmt.Errorf("listing AKS machine instances, %w", err)
 	}
@@ -543,6 +576,16 @@ func (c *CloudProvider) RepairPolicies() []cloudprovider.RepairPolicy {
 			ConditionStatus:    corev1.ConditionFalse,
 			TolerationDuration: 0,
 		},
+		// Fast-path repair for Azure Spot VMs that received a platform eviction signal.
+		// The condition is emitted by a node-level agent that polls the Instance Metadata
+		// Service for SpotRebalanceRecommendation / Preempt events. Spot eviction notice
+		// is ~30s, so toleration is 0 — we want to start the replacement immediately
+		// rather than waiting for the NodeReady=Unknown 10-minute backstop.
+		{
+			ConditionType:      SpotConditionPreemptionScheduled,
+			ConditionStatus:    corev1.ConditionTrue,
+			TolerationDuration: 0,
+		},
 	}
 }
 
@@ -645,6 +688,7 @@ func (c *CloudProvider) vmInstanceToNodeClaim(ctx context.Context, vm *armcomput
 	labels[karpv1.CapacityTypeLabelKey] = instance.GetCapacityTypeFromVM(vm)
 	labels[v1beta1.AKSLabelScaleSetPriority] = instance.GetScaleSetPriorityLabelFromVM(vm)
 	labels[v1beta1.AKSLabelPriority] = instance.GetPriorityLabelFromVM(vm)
+	labels[v1beta1.LabelUltraSSD] = fmt.Sprint(instance.GetUltraSSDEnabled(vm))
 
 	if tag, ok := vm.Tags[launchtemplate.NodePoolTagKey]; ok {
 		labels[karpv1.NodePoolLabelKey] = *tag
@@ -693,6 +737,22 @@ func truncateMessage(msg string) string {
 		return msg
 	}
 	return msg[:truncateAt] + "..."
+}
+
+// toCreateError wraps an instance-create failure as a *cloudprovider.CreateError with the
+// wrapMsg context prefix. When err carries a classified CreateError (set by the offerings
+// error handlers, e.g. SKUNotAvailable or ZonalAllocationFailure), its specific Launched
+// condition reason and message are surfaced so consumers can branch on the cause; otherwise
+// it falls back to the generic CreateInstanceFailed reason and error text, preserving prior
+// behavior.
+func toCreateError(err error, wrapMsg string) error {
+	reason := CreateInstanceFailedReason
+	message := err.Error()
+	if classified, ok := stderrors.AsType[*cloudprovider.CreateError](err); ok {
+		reason = classified.ConditionReason
+		message = classified.ConditionMessage
+	}
+	return cloudprovider.NewCreateError(fmt.Errorf("%s, %w", wrapMsg, err), reason, truncateMessage(message))
 }
 
 func setAdditionalAnnotationsForNewNodeClaim(ctx context.Context, nodeClaim *karpv1.NodeClaim, nodeClass *v1beta1.AKSNodeClass) error {

@@ -22,10 +22,14 @@ inputs:
   provision_mode:
     description: "the Karpenter provisioning mode to run the e2e test in"
     default: "aksscriptless"
+  aks_machines_pool_name:
+    description: "Name of the AKS 'machines' mode agent pool (machine API modes only). Must match the pool created at cluster-create time."
+    required: false
+    default: "mpool"
 runs:
   using: "composite"
   steps:
-  - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+  - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
     with:
       ref: ${{ inputs.git_ref }}
   - name: Build, publish, configure, and install Karpenter
@@ -35,12 +39,14 @@ runs:
       AZURE_CLUSTER_NAME: ${{ inputs.cluster_name }}
       AZURE_LOCATION: ${{ inputs.location }}
       PROVISION_MODE: ${{ inputs.provision_mode }}
+      AKS_MACHINES_POOL_NAME: ${{ inputs.aks_machines_pool_name }}
       AZURE_ACR_NAME: ${{ inputs.acr_name }}
       # Redirect Go temp/cache to /mnt/ (Azure temporary disk) which has more disk
       # space than the OS disk. 1ES pool VMs can run out of disk on / during large builds.
       GOTMPDIR: /mnt/go-tmp
       GOCACHE: /mnt/go-cache
+      KOCACHE: /mnt/ko-cache
     run: |
-      sudo mkdir -p "$GOTMPDIR" "$GOCACHE"
-      sudo chown "$(id -u):$(id -g)" "$GOTMPDIR" "$GOCACHE"
+      sudo mkdir -p "$GOTMPDIR" "$GOCACHE" "$KOCACHE"
+      sudo chown "$(id -u):$(id -g)" "$GOTMPDIR" "$GOCACHE" "$KOCACHE"
       make ci-install

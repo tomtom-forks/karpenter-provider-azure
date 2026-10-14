@@ -24,13 +24,20 @@ import (
 	sdkerrors "github.com/Azure/azure-sdk-for-go-extensions/pkg/errors"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/arm"
 	"github.com/Azure/karpenter-provider-azure/pkg/apis/v1beta1"
+	"github.com/Azure/karpenter-provider-azure/pkg/consts"
+	"github.com/Azure/karpenter-provider-azure/pkg/operator/options"
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/azclient/azapi"
+	"github.com/Azure/karpenter-provider-azure/pkg/providers/imagefamily"
+	"github.com/samber/lo"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
 
 const (
-	DiskEncryptionSetRBACMissing = "DiskEncryptionSetRBACMissing"
+	DiskEncryptionSetRBACMissing      = "DiskEncryptionSetRBACMissing"
+	FIPSRequired                      = "FIPSRequired"
+	IncompatibleProvisionMode         = "IncompatibleProvisionMode"
+	SIGRequiredForAzureContainerLinux = "SIGRequiredForAzureContainerLinux"
 	// TODO: May want to rethink how we handle successful validation + potential for RBAC removal.
 	// See this PR comment for considerations:
 	// https://github.com/Azure/karpenter-provider-azure/pull/1372#discussion_r2795367386
@@ -42,6 +49,25 @@ const (
 	ValidationFailureRequeueInterval = 1 * time.Minute
 	// DiskEncryptionSetRBACErrorMessage is the error message shown when the controlling identity lacks Reader permissions
 	DiskEncryptionSetRBACErrorMessage = "controlling identity does not have Reader role on Disk Encryption Set"
+	// KataPodSandboxingUnsupportedProvisionMode is the condition reason set when a NodeClass requests a
+	// Kata workloadRuntime but the provision mode cannot provision the Kata host stack.
+	KataPodSandboxingUnsupportedProvisionMode = "KataPodSandboxingUnsupportedProvisionMode"
+	// KataRequiresAzureLinux3 is the condition reason set when the Kubernetes version resolves
+	// imageFamily AzureLinux to Azure Linux 2, which does not publish a Kata image.
+	KataRequiresAzureLinux3 = "KataRequiresAzureLinux3"
+	// ManagedGPUUnsupportedProvisionMode is the condition reason set when a NodeClass requests
+	// the managed GPU experience but the provision mode cannot express the NVIDIA GPU profile.
+	ManagedGPUUnsupportedProvisionMode = "ManagedGPUUnsupportedProvisionMode"
+	// NodePublicIPUnsupportedProvisionMode is the condition reason set when a NodeClass enables
+	// node public IP but the provision mode cannot give nodes a public IP address. Only the AKS
+	// Machine API modes support it.
+	NodePublicIPUnsupportedProvisionMode = "NodePublicIPUnsupportedProvisionMode"
+	// WindowsUnsupportedNetworkDataplane is the condition reason set when a Windows NodeClass is
+	// configured on a cluster that uses an unsupported network dataplane.
+	WindowsUnsupportedNetworkDataplane = "WindowsUnsupportedNetworkDataplane"
+	// WindowsUnsupportedProvisionMode is the condition reason set when a Windows NodeClass is
+	// configured on a cluster that does not provision through the AKS Machine API.
+	WindowsUnsupportedProvisionMode = "WindowsUnsupportedProvisionMode"
 )
 
 type ValidationReconciler struct {
@@ -59,8 +85,65 @@ func NewValidationReconciler(
 	}
 }
 
+//nolint:gocyclo // Keep ordered validation and condition handling together in this reconciler.
 func (r *ValidationReconciler) Reconcile(ctx context.Context, nodeClass *v1beta1.AKSNodeClass) (reconcile.Result, error) {
 	logger := log.FromContext(ctx)
+	// TODO: Consolidate ordered validation steps into a list of validation functions.
+	if !validateFIPS(ctx, nodeClass) {
+		return reconcile.Result{}, nil
+	}
+	if !validateACLConfiguration(ctx, nodeClass) {
+		return reconcile.Result{}, nil
+	}
+
+	if !validateWindowsCompatibility(ctx, nodeClass) {
+		return reconcile.Result{}, nil
+	}
+
+	// A NodeClass requesting a Kata (Pod Sandboxing) workloadRuntime can only provision on a provision
+	// mode that can express the workload runtime. Surface the gap as a validation failure so the user
+	// gets fast feedback on the NodeClass (and Karpenter core won't create doomed NodeClaims) instead of
+	// silently-pending pods and churning launch failures. The provisioning paths keep their own guards
+	// as defense-in-depth.
+	if nodeClass.IsKataEnabled() && !options.FromContext(ctx).SupportsWorkloadRuntime() {
+		nodeClass.StatusConditions().SetFalse(
+			v1beta1.ConditionTypeValidationSucceeded,
+			KataPodSandboxingUnsupportedProvisionMode,
+			fmt.Sprintf("workloadRuntime %q is not supported with provision-mode %q", nodeClass.GetWorkloadRuntime(), options.FromContext(ctx).ProvisionMode),
+		)
+		return reconcile.Result{}, nil
+	}
+	if nodeClass.IsManagedGPUEnabled() && !options.FromContext(ctx).IsAKSMachineAPIMode() {
+		nodeClass.StatusConditions().SetFalse(
+			v1beta1.ConditionTypeValidationSucceeded,
+			ManagedGPUUnsupportedProvisionMode,
+			fmt.Sprintf("gpu.nvidia.managementMode %q requires an AKS Machine API provision mode; provision-mode %q is not supported", nodeClass.GetManagementMode(), options.FromContext(ctx).ProvisionMode),
+		)
+		return reconcile.Result{}, nil
+	}
+	if nodeClass.IsNodePublicIPEnabled() && !options.FromContext(ctx).SupportsNodePublicIP() {
+		nodeClass.StatusConditions().SetFalse(
+			v1beta1.ConditionTypeValidationSucceeded,
+			NodePublicIPUnsupportedProvisionMode,
+			fmt.Sprintf("nodePublicIP.enabled requires an AKS Machine API provision mode (%q or %q); provision-mode %q is not supported", consts.ProvisionModeAKSMachineAPI, consts.ProvisionModeAKSMachineAPIHeaderBatch, options.FromContext(ctx).ProvisionMode),
+		)
+		return reconcile.Result{}, nil
+	}
+
+	if nodeClass.IsKataEnabled() && lo.FromPtr(nodeClass.Spec.ImageFamily) == v1beta1.AzureLinuxImageFamily {
+		kubernetesVersion, err := nodeClass.GetKubernetesVersion()
+		if err != nil {
+			return reconcile.Result{}, fmt.Errorf("getting kubernetes version, %w", err)
+		}
+		if !imagefamily.UseAzureLinux3(kubernetesVersion) {
+			nodeClass.StatusConditions().SetFalse(
+				v1beta1.ConditionTypeValidationSucceeded,
+				KataRequiresAzureLinux3,
+				fmt.Sprintf("workloadRuntime KataVmIsolation requires Azure Linux 3 and Kubernetes 1.32 or newer; Kubernetes version %s resolves imageFamily AzureLinux to Azure Linux 2", kubernetesVersion),
+			)
+			return reconcile.Result{}, nil
+		}
+	}
 
 	// Check BYOK RBAC if DES ID is configured
 	if r.parsedDiskEncryptionSetID != nil {
@@ -86,6 +169,69 @@ func (r *ValidationReconciler) Reconcile(ctx context.Context, nodeClass *v1beta1
 	// All validations passed - requeue to detect permission revocations
 	nodeClass.StatusConditions().SetTrue(v1beta1.ConditionTypeValidationSucceeded)
 	return reconcile.Result{RequeueAfter: ValidationSuccessRequeueInterval}, nil
+}
+
+func validateACLConfiguration(ctx context.Context, nodeClass *v1beta1.AKSNodeClass) bool {
+	if reason := incompatibleACLConfiguration(ctx, nodeClass); reason != "" {
+		nodeClass.StatusConditions().SetFalse(
+			v1beta1.ConditionTypeValidationSucceeded,
+			reason,
+			"AzureContainerLinux requires an AKS Machine API provision mode and shared image gallery access (UseSIG=true)",
+		)
+		return false
+	}
+	return true
+}
+
+func incompatibleACLConfiguration(ctx context.Context, nodeClass *v1beta1.AKSNodeClass) string {
+	if lo.FromPtr(nodeClass.Spec.ImageFamily) != v1beta1.AzureContainerLinuxImageFamily {
+		return ""
+	}
+	opts := options.FromContext(ctx)
+	if !opts.IsAKSMachineAPIMode() {
+		return IncompatibleProvisionMode
+	}
+	if !opts.UseSIG {
+		return SIGRequiredForAzureContainerLinux
+	}
+	return ""
+}
+
+func validateFIPS(ctx context.Context, nodeClass *v1beta1.AKSNodeClass) bool {
+	if options.FromContext(ctx).EnableFIPS && lo.FromPtr(nodeClass.Spec.FIPSMode) != v1beta1.FIPSModeFIPS {
+		nodeClass.StatusConditions().SetFalse(
+			v1beta1.ConditionTypeValidationSucceeded,
+			FIPSRequired,
+			"AKSNodeClass spec.fipsMode must be set to FIPS because FIPS is enabled at the cluster level",
+		)
+		return false
+	}
+	return true
+}
+
+func validateWindowsCompatibility(ctx context.Context, nodeClass *v1beta1.AKSNodeClass) bool {
+	imageFamily := lo.FromPtr(nodeClass.Spec.ImageFamily)
+	if !v1beta1.IsWindowsImageFamily(imageFamily) {
+		return true
+	}
+	providerOptions := options.FromContext(ctx)
+	if providerOptions.NetworkDataplane == consts.NetworkDataplaneCilium {
+		nodeClass.StatusConditions().SetFalse(
+			v1beta1.ConditionTypeValidationSucceeded,
+			WindowsUnsupportedNetworkDataplane,
+			fmt.Sprintf("imageFamily %q is not supported with network-dataplane %q", imageFamily, providerOptions.NetworkDataplane),
+		)
+		return false
+	}
+	if !providerOptions.IsAKSMachineAPIMode() {
+		nodeClass.StatusConditions().SetFalse(
+			v1beta1.ConditionTypeValidationSucceeded,
+			WindowsUnsupportedProvisionMode,
+			fmt.Sprintf("imageFamily %q is not supported with provision-mode %q; Windows requires an AKS Machine API provision mode", imageFamily, providerOptions.ProvisionMode),
+		)
+		return false
+	}
+	return true
 }
 
 func (r *ValidationReconciler) validateDiskEncryptionSetRBAC(ctx context.Context) error {

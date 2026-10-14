@@ -46,7 +46,7 @@ func (u CustomImages) Name() string {
 	return v1beta1.CustomImageFamily
 }
 
-func (u CustomImages) DefaultImages(useSIG bool, fipsMode *v1beta1.FIPSMode) []types.DefaultImageOutput {
+func (u CustomImages) DefaultImages(useSIG bool, fipsMode *v1beta1.FIPSMode, _ bool, _ bool) []types.DefaultImageOutput {
 	if lo.FromPtr(fipsMode) == v1beta1.FIPSModeFIPS {
 		// Note: FIPS images aren't supported in public galleries, only shared image galleries
 		if !useSIG {
@@ -98,17 +98,18 @@ func (u CustomImages) ScriptlessCustomData(
 ) bootstrap.Bootstrapper {
 	return bootstrap.AKS{
 		Options: bootstrap.Options{
-			ClusterName:      u.Options.ClusterName,
-			ClusterEndpoint:  u.Options.ClusterEndpoint,
-			KubeletConfig:    kubeletConfig,
-			Taints:           taints,
-			Labels:           labels,
-			CABundle:         caBundle,
-			GPUNode:          u.Options.GPUNode,
-			GPUDriverVersion: u.Options.GPUDriverVersion,
-			GPUDriverType:    u.Options.GPUDriverType,
-			GPUImageSHA:      u.Options.GPUImageSHA,
-			SubnetID:         u.Options.SubnetID,
+			ClusterName:                  u.Options.ClusterName,
+			ClusterEndpoint:              u.Options.ClusterEndpoint,
+			KubeletConfig:                kubeletConfig,
+			Taints:                       taints,
+			Labels:                       labels,
+			CABundle:                     caBundle,
+			GPUNode:                      u.Options.GPUNode,
+			GPUDriverVersion:             u.Options.GPUDriverVersion,
+			GPUDriverType:                u.Options.GPUDriverType,
+			GPUImageSHA:                  u.Options.GPUImageSHA,
+			GPUDriverInstallationEnabled: u.Options.GPUDriverInstallationEnabled,
+			SubnetID:                     u.Options.SubnetID,
 		},
 		Arch:                           u.Options.Arch,
 		TenantID:                       u.Options.TenantID,
@@ -116,6 +117,8 @@ func (u CustomImages) ScriptlessCustomData(
 		Location:                       u.Options.Location,
 		KubeletIdentityClientID:        u.Options.KubeletIdentityClientID,
 		ResourceGroup:                  u.Options.ResourceGroup,
+		NetworkSecurityGroupName:       u.Options.NetworkSecurityGroupName,
+		RouteTableName:                 u.Options.RouteTableName,
 		APIServerName:                  u.Options.APIServerName,
 		KubeletClientTLSBootstrapToken: u.Options.KubeletClientTLSBootstrapToken,
 		NetworkPlugin:                  u.Options.NetworkPlugin,
@@ -135,9 +138,12 @@ func (u CustomImages) CustomScriptsNodeBootstrapping(
 	storageProfile string,
 	nodeBootstrappingClient types.NodeBootstrappingAPI,
 	fipsMode *v1beta1.FIPSMode,
+	_ *v1beta1.WorkloadRuntime,
 	_ *v1beta1.LocalDNS,
 	_ *v1beta1.ArtifactStreaming,
 	_ *v1beta1.LinuxOSConfiguration,
+	_ *bool,
+	_ *bool,
 ) customscriptsbootstrap.Bootstrapper {
 	return customscriptsbootstrap.ProvisionClientBootstrap{
 		ClusterName:                    u.Options.ClusterName,
@@ -155,6 +161,7 @@ func (u CustomImages) CustomScriptsNodeBootstrapping(
 		InstanceType:                   instanceType,
 		StorageProfile:                 storageProfile,
 		ClusterResourceGroup:           u.Options.ClusterResourceGroup,
+		GPUDriverInstallationEnabled:   u.Options.GPUDriverInstallationEnabled,
 		NodeBootstrappingProvider:      nodeBootstrappingClient,
 		OSSKU:                          customscriptsbootstrap.ImageFamilyOSSKUUbuntu2404,
 		FIPSMode:                       fipsMode,
