@@ -3,14 +3,28 @@
 This fork builds the controller image with [`ko`](https://ko.build) (same toolchain as
 `hack/release/common.sh` and the `container-build.yaml` workflow). There is no Dockerfile —
 `ko` compiles `./cmd/controller` and layers it onto the base image from `.ko.yaml`
-(`mcr.microsoft.com/azurelinux/distroless/minimal:3.0`).
+(`mcr.microsoft.com/azurelinux/distroless/base:3.0`).
 
 ## Prerequisites
 
 - `ko` (`go install github.com/google/ko@latest`)
-- Go matching `go.mod` (currently `1.26.3`)
-- Docker Desktop running (for `--local` builds)
+- Go matching `go.mod` (currently `1.27.2`; `GOTOOLCHAIN=auto` downloads it)
+- Docker Desktop running (for `--local` builds, and for `az acr login`)
 - `az acr login -n <acr>` first if pushing to ACR
+
+## Pure-Go build config (required on macOS)
+
+Upstream's `.ko.yaml` sets `CGO_ENABLED=1`: their release builds use Microsoft Go with
+`hack/go-crossbuild.sh` (Linux cross-compilers) for FIPS crypto. That fails on macOS, and we don't
+need FIPS, so build a static pure-Go binary from a copy of the config instead of editing
+`.ko.yaml` (keeps upstream syncs conflict-free):
+
+```bash
+export KO_CONFIG_PATH=$(mktemp -d)
+sed 's/CGO_ENABLED=1/CGO_ENABLED=0/' .ko.yaml > "$KO_CONFIG_PATH/.ko.yaml"
+```
+
+The commands below assume `KO_CONFIG_PATH` is set this way.
 
 > **Building an image for a cluster? Use [Push to ACR](#push-to-acr-multi-arch) below.**
 > `--local` cannot produce a multi-arch image (see the note in that section), so a `--local`
@@ -58,12 +72,19 @@ This is the path for any image that runs on a cluster. Drop `--local`, run
 
 ```bash
 az acr login -n cicdprodacr
+VERSION=$(git ls-remote --tags --refs upstream 'v*' | awk -F/ '{print $NF}' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1)
+GOFLAGS="-ldflags=-X=sigs.k8s.io/karpenter/pkg/operator.Version=${VERSION}" \
 SOURCE_DATE_EPOCH=$(date +%s) KO_DATA_DATE_EPOCH=$(date +%s) \
 KO_DOCKER_REPO=cicdprodacr.azurecr.io/karpenter \
 ko build -B --sbom none --platform all \
-  -t "$(git ls-remote --tags --refs upstream 'v*' | awk -F/ '{print $NF}' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1 | sed 's/^v//')" \
+  -t "${VERSION}" -t "$(git rev-parse --short=8 HEAD)" \
   ./cmd/controller
 ```
+
+Clusters reference the `v`-prefixed tag (e.g. `v1.14.5`); the commit-SHA tag is for traceability.
+If the push fails with `UNAUTHORIZED`, `az acr login` didn't write Docker credentials (Docker not
+running): use `az acr login -n <acr> --expose-token` and `docker login` /
+`crane auth login` with user `00000000-0000-0000-0000-000000000000` and the returned token.
 
 Verify both arches landed in the index:
 
