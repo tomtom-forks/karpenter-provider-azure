@@ -1347,7 +1347,7 @@ var _ = Describe("InstanceType Provider", func() {
 			})
 			// TomTom: OSDiskSizeDynamic. Expected sizes match the fork's pre-v1.14 behavior on our runner SKUs.
 			Context("ResolveOSDiskProfileFromSKU with OSDiskSizeDynamic", func() {
-				DescribeTable("should size the ephemeral OS disk to the largest single local disk",
+				DescribeTable("should size the ephemeral OS disk to the local disk capacity",
 					func(sku *skewer.SKU, expected instancetype.OSDiskProfile) {
 						profile := instancetype.ResolveOSDiskProfileFromSKU(sku, lo.ToPtr[int32](50), "", false, true)
 						Expect(profile).To(Equal(expected))
@@ -1358,9 +1358,15 @@ var _ = Describe("InstanceType Provider", func() {
 					Entry("single NVMe disk (Standard_D2pds_v6)",
 						dynamicDiskTestSKU(map[string]string{"SupportedEphemeralOSDiskPlacements": "NvmeDisk", "MaxResourceVolumeMB": "0", "NvmeDiskSizeInMiB": "112640", "NvmeSizePerDiskInMiB": "112640"}),
 						instancetype.OSDiskProfile{SizeGB: 110, Type: armcontainerservice.OSDiskTypeEphemeral, Placement: lo.ToPtr(armcompute.DiffDiskPlacementNvmeDisk)}),
-					Entry("multiple NVMe disks use the per-disk size (Standard_D32pds_v6)",
+					Entry("two NVMe disks span the total size (Standard_D16ads_v6)",
+						dynamicDiskTestSKU(map[string]string{"SupportedEphemeralOSDiskPlacements": "NvmeDisk", "MaxResourceVolumeMB": "0", "NvmeDiskSizeInMiB": "901120", "NvmeSizePerDiskInMiB": "450560"}),
+						instancetype.OSDiskProfile{SizeGB: 880, Type: armcontainerservice.OSDiskTypeEphemeral, Placement: lo.ToPtr(armcompute.DiffDiskPlacementNvmeDisk)}),
+					Entry("four NVMe disks span the total size (Standard_D32pds_v6)",
 						dynamicDiskTestSKU(map[string]string{"SupportedEphemeralOSDiskPlacements": "NvmeDisk", "MaxResourceVolumeMB": "0", "NvmeDiskSizeInMiB": "1802240", "NvmeSizePerDiskInMiB": "450560"}),
-						instancetype.OSDiskProfile{SizeGB: 440, Type: armcontainerservice.OSDiskTypeEphemeral, Placement: lo.ToPtr(armcompute.DiffDiskPlacementNvmeDisk)}),
+						instancetype.OSDiskProfile{SizeGB: 1760, Type: armcontainerservice.OSDiskTypeEphemeral, Placement: lo.ToPtr(armcompute.DiffDiskPlacementNvmeDisk)}),
+					Entry("NVMe total is capped at the ephemeral OS disk maximum (Standard_D96ads_v6)",
+						dynamicDiskTestSKU(map[string]string{"SupportedEphemeralOSDiskPlacements": "NvmeDisk", "MaxResourceVolumeMB": "0", "NvmeDiskSizeInMiB": "5406720", "NvmeSizePerDiskInMiB": "901120"}),
+						instancetype.OSDiskProfile{SizeGB: 2040, Type: armcontainerservice.OSDiskTypeEphemeral, Placement: lo.ToPtr(armcompute.DiffDiskPlacementNvmeDisk)}),
 					Entry("cache disk is preferred over resource disk (Standard_NV6ads_A10_v5)",
 						dynamicDiskTestSKU(map[string]string{"SupportedEphemeralOSDiskPlacements": "ResourceDisk,CacheDisk", "CachedDiskBytes": "154618822656", "MaxResourceVolumeMB": "184320"}),
 						instancetype.OSDiskProfile{SizeGB: 143, Type: armcontainerservice.OSDiskTypeEphemeral, Placement: lo.ToPtr(armcompute.DiffDiskPlacementCacheDisk)}),

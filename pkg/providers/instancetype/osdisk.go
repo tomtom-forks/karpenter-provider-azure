@@ -264,32 +264,35 @@ func listRankedEligibleEphemeralOSDiskPlacements(sku *skewer.SKU) []ephemeralOSD
 }
 
 // TomTom: resolveDynamicOSDiskProfile backs AKSNodeClass.Spec.OSDiskSizeDynamic. Unlike upstream
-// auto-sizing it has no 128 GiB minimum and sizes NVMe placements to a single NVMe disk
-// (NvmeSizePerDiskInMiB, not the multi-disk total). Placement priority is NvmeDisk > CacheDisk > ResourceDisk.
+// auto-sizing it has no 128 GiB minimum, and NVMe placements span all NVMe disks (NvmeDiskSizeInMiB).
+// Placement priority is NvmeDisk > CacheDisk > ResourceDisk.
 func resolveDynamicOSDiskProfile(sku *skewer.SKU, trustedLaunch bool) (OSDiskProfile, bool) {
 	if sku == nil || !sku.IsEphemeralOSDiskSupported() {
 		return OSDiskProfile{}, false
 	}
 
-	nvmePerDiskMiB, _ := sku.GetCapabilityIntegerQuantity("NvmeSizePerDiskInMiB")
+	nvmeMiB, _ := sku.GetCapabilityIntegerQuantity("NvmeDiskSizeInMiB")
 	cacheBytes, _ := sku.MaxCachedDiskBytes()
 	resourceMiB, _ := sku.MaxResourceVolumeMB() // NOTE: MaxResourceVolumeMB is actually in MiBs
 
-	var sizeBytes int64
+	// Round decimal-GB capacities to GiB, matching the sizing used before the v1.14 sync.
+	roundToGiB := func(bytes int64) int64 {
+		return int64(math.Round(float64(bytes/int64(units.Gigabyte)) / (float64(units.GiB) / float64(units.Gigabyte))))
+	}
+
+	var sizeGiB int64
 	var placement armcompute.DiffDiskPlacement
 	switch {
-	case nvmePerDiskMiB > 0 && sku.HasCapabilityWithSeparator("SupportedEphemeralOSDiskPlacements", string(armcompute.DiffDiskPlacementNvmeDisk)):
-		sizeBytes, placement = nvmePerDiskMiB*int64(units.MiB), armcompute.DiffDiskPlacementNvmeDisk
+	case nvmeMiB > 0 && sku.HasCapabilityWithSeparator("SupportedEphemeralOSDiskPlacements", string(armcompute.DiffDiskPlacementNvmeDisk)):
+		sizeGiB, placement = nvmeMiB*int64(units.MiB)/int64(units.GiB), armcompute.DiffDiskPlacementNvmeDisk
 	case cacheBytes > 0:
-		sizeBytes, placement = cacheBytes, armcompute.DiffDiskPlacementCacheDisk
+		sizeGiB, placement = roundToGiB(cacheBytes), armcompute.DiffDiskPlacementCacheDisk
 	case resourceMiB > 0:
-		sizeBytes, placement = resourceMiB*int64(units.MiB), armcompute.DiffDiskPlacementResourceDisk
+		sizeGiB, placement = roundToGiB(resourceMiB*int64(units.MiB)), armcompute.DiffDiskPlacementResourceDisk
 	default:
 		return OSDiskProfile{}, false
 	}
 
-	// Round the decimal-GB capacity to GiB, matching the sizing used before the v1.14 sync.
-	sizeGiB := int64(math.Round(float64(sizeBytes/int64(units.Gigabyte)) / (float64(units.GiB) / float64(units.Gigabyte))))
 	if trustedLaunch {
 		sizeGiB--
 	}
