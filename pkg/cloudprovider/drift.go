@@ -47,7 +47,6 @@ const (
 	NoDrift cloudprovider.DriftReason = ""
 )
 
-// nolint:unused
 func (c *CloudProvider) isNodeClassDrifted(ctx context.Context, nodeClaim *karpv1.NodeClaim, nodeClass *v1beta1.AKSNodeClass) (cloudprovider.DriftReason, error) {
 	// TODO: if we find more expensive checks, such as reading VMs or NICs from Azure, are being duplicated between checks, we should
 	//       produce a lazy at-most-once that allows a check to cache a value for later checks to read.
@@ -57,19 +56,21 @@ func (c *CloudProvider) isNodeClassDrifted(ctx context.Context, nodeClaim *karpv
 		return "", fmt.Errorf("nodeclaim %s is missing provider ID", nodeClaim.Name)
 	}
 
-	// TomTom: areStaticFieldsDrifted and isImageVersionDrifted are intentionally
-	// excluded so custom-image nodeclasses aren't churned by upstream image-version drift.
 	var checks []func(ctx context.Context, nodeClaim *karpv1.NodeClaim, nodeClass *v1beta1.AKSNodeClass) (cloudprovider.DriftReason, error)
 	if _, isAKSMachine := instance.GetAKSMachineNameFromNodeClaim(nodeClaim); isAKSMachine {
 		checks = []func(ctx context.Context, nodeClaim *karpv1.NodeClaim, nodeClass *v1beta1.AKSNodeClass) (cloudprovider.DriftReason, error){
+			c.areStaticFieldsDrifted,
 			c.isK8sVersionDrifted,
+			c.isImageVersionDrifted,
 			c.isMachineDrifted,
 		}
 	} else {
 		// For legacy nodes
 		checks = []func(ctx context.Context, nodeClaim *karpv1.NodeClaim, nodeClass *v1beta1.AKSNodeClass) (cloudprovider.DriftReason, error){
+			c.areStaticFieldsDrifted,
 			c.isK8sVersionDrifted,
 			c.isKubeletIdentityDrifted,
+			c.isImageVersionDrifted,
 		}
 	}
 
@@ -86,7 +87,6 @@ func (c *CloudProvider) isNodeClassDrifted(ctx context.Context, nodeClaim *karpv
 	return "", nil
 }
 
-// nolint:unused
 func (c *CloudProvider) areStaticFieldsDrifted(ctx context.Context, nodeClaim *karpv1.NodeClaim, nodeClass *v1beta1.AKSNodeClass) (cloudprovider.DriftReason, error) {
 	logger := log.FromContext(ctx)
 
@@ -143,7 +143,6 @@ func (c *CloudProvider) isK8sVersionDrifted(ctx context.Context, nodeClaim *karp
 	return "", nil
 }
 
-// nolint: unused
 func (c *CloudProvider) isImageVersionDrifted(
 	ctx context.Context,
 	nodeClaim *karpv1.NodeClaim,

@@ -20,6 +20,8 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"strconv"
+	"strings"
 
 	"github.com/Azure/skewer"
 	"github.com/samber/lo"
@@ -27,6 +29,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 
 	"github.com/Azure/karpenter-provider-azure/pkg/apis/v1beta1"
+	"github.com/Azure/karpenter-provider-azure/pkg/consts"
 	"github.com/Azure/karpenter-provider-azure/pkg/utils"
 	karpv1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
@@ -38,12 +41,11 @@ import (
 )
 
 const (
-	MemoryAvailable          = "memory.available"
-	DefaultEvictionThreshold = "100Mi"
+	MemoryAvailable        = "memory.available"
+	DefaultMemoryAvailable = "100Mi"
 )
 
 var (
-
 	//reservedCPUTaxVCPU denotes the tax brackets for Virtual CPU cores.
 	reservedCPUTaxVCPU = TaxBrackets{
 		{
@@ -75,7 +77,7 @@ type TaxBrackets []struct {
 	Rate float64
 }
 
-// Calculate expects Memory in Gi and CPU in cores.
+// Calculate expects CPU in cores.
 func (t TaxBrackets) Calculate(amount float64) float64 {
 	var tax, lower float64
 
@@ -94,29 +96,36 @@ func (t TaxBrackets) Calculate(amount float64) float64 {
 	return tax
 }
 
-func NewInstanceType(
+func newInstanceType(
 	ctx context.Context,
 	sku *skewer.SKU,
 	vmsize *skewer.VMSizeType,
-	kc *v1beta1.KubeletConfiguration,
 	region string,
 	offerings cloudprovider.Offerings,
-	nodeClass *v1beta1.AKSNodeClass,
+	params *instanceTypeParameters,
 	architecture string,
 ) *cloudprovider.InstanceType {
+	opts := options.FromContext(ctx)
+	totalMemoryMiB := memoryMiB(sku)
+	enableNodeHardening := opts.ShouldUseNodeHardening()
+	capacity := computeCapacity(ctx, sku, params)
 	return &cloudprovider.InstanceType{
 		Name:         sku.GetName(),
-		Requirements: computeRequirements(options.FromContext(ctx), sku, vmsize, architecture, offerings, region, nodeClass),
+		Requirements: computeRequirements(opts, sku, vmsize, architecture, offerings, region, params),
 		Offerings:    offerings,
-		Capacity:     computeCapacity(ctx, sku, nodeClass),
+		Capacity:     capacity,
 		Overhead: &cloudprovider.InstanceTypeOverhead{
-			KubeReserved:      KubeReservedResources(lo.Must(sku.VCPU()), lo.Must(sku.Memory()), int64(lo.FromPtrOr(nodeClass.Spec.MaxPods, 110))),
-			SystemReserved:    SystemReservedResources(),
-			EvictionThreshold: EvictionThreshold(),
+			KubeReserved:   KubeReservedResources(lo.Must(sku.VCPU()), totalMemoryMiB, params.MaxPods, enableNodeHardening, params.KubeReserved),
+			SystemReserved: SystemReservedResources(totalMemoryMiB, opts.NetworkPlugin, enableNodeHardening),
+			EvictionThreshold: EvictionThreshold(
+				totalMemoryMiB,
+				capacity[corev1.ResourceEphemeralStorage],
+				enableNodeHardening,
+				params.EvictionHard,
+			),
 		},
 	}
 }
-
 func computeRequirements(
 	opts *options.Options,
 	sku *skewer.SKU,
@@ -124,13 +133,13 @@ func computeRequirements(
 	architecture string,
 	offerings cloudprovider.Offerings,
 	region string,
-	nodeClass *v1beta1.AKSNodeClass,
+	params *instanceTypeParameters,
 ) scheduling.Requirements {
 	requirements := scheduling.NewRequirements(
 		// Well Known Upstream
 		scheduling.NewRequirement(corev1.LabelInstanceTypeStable, corev1.NodeSelectorOpIn, sku.GetName()),
 		scheduling.NewRequirement(corev1.LabelArchStable, corev1.NodeSelectorOpIn, getArchitecture(architecture)),
-		scheduling.NewRequirement(corev1.LabelOSStable, corev1.NodeSelectorOpIn, string(corev1.Linux)),
+		scheduling.NewRequirement(corev1.LabelOSStable, corev1.NodeSelectorOpIn, v1beta1.GetOSForImageFamily(params.ImageFamily)),
 		scheduling.NewRequirement(corev1.LabelTopologyZone, corev1.NodeSelectorOpIn, lo.Map(offerings.Available(), func(o *cloudprovider.Offering, _ int) string {
 			return o.Requirements.Get(corev1.LabelTopologyZone).Any()
 		})...),
@@ -146,6 +155,9 @@ func computeRequirements(
 		scheduling.NewRequirement(v1beta1.LabelPlacementScope, corev1.NodeSelectorOpIn, lo.Map(offerings.Available(), func(o *cloudprovider.Offering, _ int) string {
 			return o.Requirements.Get(v1beta1.LabelPlacementScope).Any()
 		})...),
+		scheduling.NewRequirement(v1beta1.LabelUltraSSD, corev1.NodeSelectorOpIn, lo.FlatMap(offerings.Available(), func(o *cloudprovider.Offering, _ int) []string {
+			return o.Requirements.Get(v1beta1.LabelUltraSSD).Values()
+		})...),
 		scheduling.NewRequirement(v1beta1.LabelSKUCPU, corev1.NodeSelectorOpIn, fmt.Sprint(vcpuCount(sku))),
 		scheduling.NewRequirement(v1beta1.LabelSKUMemory, corev1.NodeSelectorOpIn, fmt.Sprint((memoryMiB(sku)))), // in MiB
 		scheduling.NewRequirement(v1beta1.AKSLabelCPU, corev1.NodeSelectorOpIn, fmt.Sprint(vcpuCount(sku))),      // AKS domain.
@@ -157,8 +169,10 @@ func computeRequirements(
 		scheduling.NewRequirement(v1beta1.AKSLabelMode, corev1.NodeSelectorOpIn, v1beta1.ModeSystem, v1beta1.ModeUser),
 		scheduling.NewRequirement(v1beta1.AKSLabelScaleSetPriority, corev1.NodeSelectorOpIn, v1beta1.ScaleSetPriorityRegular, v1beta1.ScaleSetPrioritySpot),
 		scheduling.NewRequirement(v1beta1.AKSLabelPriority, corev1.NodeSelectorOpIn, v1beta1.PriorityRegular, v1beta1.PrioritySpot),
-		scheduling.NewRequirement(v1beta1.AKSLabelOSSKU, corev1.NodeSelectorOpIn, v1beta1.GetOSSKUFromImageFamily(lo.FromPtr(nodeClass.Spec.ImageFamily))),
+		scheduling.NewRequirement(v1beta1.AKSLabelOSSKU, corev1.NodeSelectorOpIn, v1beta1.GetOSSKUFromImageFamily(params.ImageFamily)),
 		scheduling.NewRequirement(v1beta1.AKSLabelFIPSEnabled, corev1.NodeSelectorOpDoesNotExist), // AKS only sets this label if FIPS is enabled, otherwise it's expected to be empty
+		// AKS only stamps the Kata label when the Pod Sandboxing workloadRuntime is requested; otherwise expected to be absent.
+		scheduling.NewRequirement(v1beta1.AKSLabelKataVMIsolation, corev1.NodeSelectorOpDoesNotExist),
 
 		// composites
 		scheduling.NewRequirement(v1beta1.LabelSKUName, corev1.NodeSelectorOpDoesNotExist),
@@ -187,8 +201,13 @@ func computeRequirements(
 	setRequirementsHyperVGeneration(requirements, sku)
 	setRequirementsGPU(requirements, sku, vmsize)
 	setRequirementsVersion(requirements, vmsize)
-	if lo.FromPtr(nodeClass.Spec.FIPSMode) == v1beta1.FIPSModeFIPS {
+	if params.FIPSMode == v1beta1.FIPSModeFIPS {
 		requirements[v1beta1.AKSLabelFIPSEnabled].Insert("true")
+	}
+	// Advertise the Kata node label AKS will stamp so Karpenter can scale up for pending pods that
+	// select it.
+	if params.KataEnabled {
+		requirements[v1beta1.AKSLabelKataVMIsolation].Insert("true")
 	}
 
 	return requirements
@@ -241,12 +260,12 @@ func getArchitecture(architecture string) string {
 	return architecture // unrecognized
 }
 
-func computeCapacity(ctx context.Context, sku *skewer.SKU, nodeClass *v1beta1.AKSNodeClass) corev1.ResourceList {
+func computeCapacity(ctx context.Context, sku *skewer.SKU, params *instanceTypeParameters) corev1.ResourceList {
 	return corev1.ResourceList{
 		corev1.ResourceCPU:                    *cpu(sku),
 		corev1.ResourceMemory:                 *memoryWithoutOverhead(ctx, sku),
-		corev1.ResourceEphemeralStorage:       *ephemeralStorage(nodeClass),
-		corev1.ResourcePods:                   *pods(ctx, nodeClass),
+		corev1.ResourceEphemeralStorage:       *ephemeralStorage(sku, params),
+		corev1.ResourcePods:                   *pods(params),
 		corev1.ResourceName("nvidia.com/gpu"): *gpuNvidiaCount(sku),
 		corev1.ResourceName("amd.com/gpu"):    *gpuAMDCount(sku),
 	}
@@ -310,43 +329,120 @@ func CalculateMemoryWithoutOverhead(vmMemoryOverheadPercent float64, skuMemoryGi
 	return memory
 }
 
-func ephemeralStorage(nodeClass *v1beta1.AKSNodeClass) *resource.Quantity {
-	return resource.NewScaledQuantity(int64(lo.FromPtr(nodeClass.Spec.OSDiskSizeGB)), resource.Giga)
+// ephemeralStorage conservatively models the formatted node filesystem. Azure's API
+// size is GiB, while the existing decimal-G quantity leaves headroom for filesystem
+// and image overhead before kubelet's separate eviction reservation is applied.
+func ephemeralStorage(sku *skewer.SKU, params *instanceTypeParameters) *resource.Quantity {
+	profile := ResolveOSDiskProfileFromSKU(sku, params.OSDiskSizeGB, params.OSDiskType, params.TrustedLaunch)
+	return resources.Quantity(fmt.Sprintf("%dG", profile.SizeGB))
 }
 
-func pods(ctx context.Context, nc *v1beta1.AKSNodeClass) *resource.Quantity {
-	networkPlugin, networkPluginMode := options.FromContext(ctx).NetworkPlugin, options.FromContext(ctx).NetworkPluginMode
-	return resource.NewQuantity(int64(utils.GetMaxPods(nc, networkPlugin, networkPluginMode)), resource.DecimalSI)
+func pods(params *instanceTypeParameters) *resource.Quantity {
+	return resource.NewQuantity(int64(params.MaxPods), resource.DecimalSI)
 }
 
-func SystemReservedResources() corev1.ResourceList {
-	// AKS does not set system-reserved values and only CPU and memory are considered
-	// https://learn.microsoft.com/en-us/azure/aks/concepts-clusters-workloads#resource-reservations
+func SystemReservedResources(totalMemoryMiB int64, networkPlugin string, enableNodeHardening bool) corev1.ResourceList {
+	if !enableNodeHardening {
+		return corev1.ResourceList{
+			corev1.ResourceCPU:    resource.Quantity{},
+			corev1.ResourceMemory: resource.Quantity{},
+		}
+	}
 	return corev1.ResourceList{
-		corev1.ResourceCPU:    resource.Quantity{},
-		corev1.ResourceMemory: resource.Quantity{},
+		corev1.ResourceCPU:              *resource.NewScaledQuantity(systemReservedCPUMillicores, resource.Milli),
+		corev1.ResourceMemory:           *resource.NewQuantity(systemReservedMemoryMiB(totalMemoryMiB, networkPlugin == consts.NetworkPluginAzure)*bytesPerMiB, resource.BinarySI),
+		corev1.ResourceEphemeralStorage: resource.MustParse(systemReservedEphemeralStorage),
 	}
 }
 
-func KubeReservedResources(vcpus int64, memoryGib float64, maxPodCount int64) corev1.ResourceList {
-	kubeReservedResources := corev1.ResourceList{
-		corev1.ResourceCPU:    *resource.NewScaledQuantity(int64(1000*reservedCPUTaxVCPU.Calculate(float64(vcpus))), resource.Milli),
-		corev1.ResourceMemory: AzureKubeMemoryReservation(memoryGib, maxPodCount),
+func KubeReservedResources(vcpus, totalMemoryMiB int64, maxPods int32, enableNodeHardening bool, overrides map[string]string) corev1.ResourceList {
+	// AKS reserves 20 MiB per pod plus 50 MiB, capped at 25% of node memory.
+	// https://learn.microsoft.com/azure/aks/node-resource-reservations#memory-reservations
+	reservedMemoryMiB := min(20*int64(maxPods)+50, totalMemoryMiB/4)
+	reservedCPUMilli := int64(1000 * reservedCPUTaxVCPU.Calculate(float64(vcpus)))
+
+	if enableNodeHardening {
+		reservedMemoryMiB = hardenedKubeReservedMemoryMiB(maxPods, totalMemoryMiB)
 	}
 
-	return kubeReservedResources
+	resources := corev1.ResourceList{
+		corev1.ResourceCPU:    *resource.NewScaledQuantity(reservedCPUMilli, resource.Milli),
+		corev1.ResourceMemory: *resource.NewQuantity(reservedMemoryMiB*bytesPerMiB, resource.BinarySI),
+	}
+	if len(overrides) > 0 {
+		for _, resourceName := range []corev1.ResourceName{corev1.ResourceCPU, corev1.ResourceMemory} {
+			if value, ok := overrides[string(resourceName)]; ok {
+				if quantity, err := resource.ParseQuantity(value); err == nil {
+					resources[resourceName] = quantity
+				}
+			}
+		}
+	}
+
+	return resources
 }
 
-func EvictionThreshold() corev1.ResourceList {
+func EvictionThreshold(totalMemoryMiB int64, ephemeralStorageCapacity resource.Quantity, enableNodeHardening bool, overrides map[string]string) corev1.ResourceList {
 	return corev1.ResourceList{
-		corev1.ResourceMemory: resource.MustParse(DefaultEvictionThreshold),
+		corev1.ResourceMemory:           memoryEvictionThreshold(totalMemoryMiB, enableNodeHardening, overrides),
+		corev1.ResourceEphemeralStorage: ephemeralStorageEvictionThreshold(ephemeralStorageCapacity, overrides),
 	}
 }
 
-func AzureKubeMemoryReservation(memoryGib float64, maxPodCount int64) resource.Quantity {
-	aksNodeMemoryReserve := (memoryGib * 0.25) * 1024 * 1024 * 1024
-	aksPerPodMemoryReserve := float64((maxPodCount*20)+150) * 1024 * 1024
+func memoryEvictionThreshold(totalMemoryMiB int64, enableNodeHardening bool, overrides map[string]string) resource.Quantity {
+	memory := resource.MustParse(DefaultMemoryAvailable)
+	if enableNodeHardening {
+		_, hardMemoryMiB := evictionMemoryLadder(totalMemoryMiB)
+		memory = *resource.NewQuantity(hardMemoryMiB*bytesPerMiB, resource.BinarySI)
+	}
+	if len(overrides) == 0 {
+		return memory
+	}
+	// Values are validated at CRD admission; an unexpected parse failure here falls back to the computed default.
+	value, ok := overrides[MemoryAvailable]
+	if !ok {
+		return memory
+	}
+	if strings.HasSuffix(value, "%") {
+		if percentage, err := strconv.ParseFloat(strings.TrimSuffix(value, "%"), 64); err == nil && !math.IsNaN(percentage) && percentage >= 0 && percentage <= 100 {
+			memory = *resource.NewQuantity(int64(float64(totalMemoryMiB*bytesPerMiB)*float64(float32(percentage)/100)), resource.BinarySI)
+		}
+	} else if quantity, err := resource.ParseQuantity(value); err == nil {
+		memory = quantity
+	}
+	return memory
+}
 
-	// Use the minimum of newMemory and aksDefaultMemoryReserve
-	return *resource.NewQuantity(int64(math.Min(aksPerPodMemoryReserve, aksNodeMemoryReserve)), resource.BinarySI)
+func ephemeralStorageEvictionThreshold(ephemeralStorageCapacity resource.Quantity, overrides map[string]string) resource.Quantity {
+	// Kubelet parses percentage eviction thresholds as float32, converts them
+	// to float64 for multiplication, and truncates the result to bytes.
+	storagePercentage := float32(hardEvictionNodeFSAvailablePercent) / 100
+	storageBytes := int64(float64(ephemeralStorageCapacity.Value()) * float64(storagePercentage))
+	// Honor a customer nodefs.available override so the modeled ephemeral-storage
+	// overhead matches the eviction threshold actually applied to the kubelet.
+	if value, ok := overrideValue(overrides, NodeFSAvailable); ok {
+		if strings.HasSuffix(value, "%") {
+			if percentage, err := strconv.ParseFloat(strings.TrimSuffix(value, "%"), 64); err == nil && !math.IsNaN(percentage) && percentage >= 0 && percentage <= 100 {
+				storageBytes = int64(float64(ephemeralStorageCapacity.Value()) * float64(float32(percentage)/100))
+			}
+		} else if quantity, err := resource.ParseQuantity(value); err == nil {
+			storageBytes = quantity.Value()
+		}
+	}
+	return *resource.NewQuantity(storageBytes, resource.BinarySI)
+}
+
+// overrideValue returns the customer override for key, if present.
+func overrideValue(overrides map[string]string, key string) (string, bool) {
+	value, ok := overrides[key]
+	return value, ok
+}
+
+// SoftEvictionThreshold returns the hardened soft-eviction memory threshold
+// for the VM's total memory using the AKS RP memory ladder.
+func SoftEvictionThreshold(totalMemoryMiB int64) corev1.ResourceList {
+	softMemoryMiB, _ := evictionMemoryLadder(totalMemoryMiB)
+	return corev1.ResourceList{
+		corev1.ResourceMemory: *resource.NewQuantity(softMemoryMiB*bytesPerMiB, resource.BinarySI),
+	}
 }

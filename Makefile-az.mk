@@ -11,7 +11,8 @@ ifeq ($(CODESPACES),true)
   AZURE_RESOURCE_GROUP ?= $(CODESPACE_NAME)
   AZURE_ACR_NAME ?= $(subst -,,$(CODESPACE_NAME))
 else
-  NAME_SUFFIX ?= $(shell git config user.email | cut -d'@' -f1 | tr -d '+')
+  # generate a unique suffix based on the user's email
+  NAME_SUFFIX ?= $(shell git config user.email | cut -d'@' -f1 | tr -cd '[:alnum:]')
   AZURE_RESOURCE_GROUP ?= $(COMMON_NAME)$(NAME_SUFFIX)
   AZURE_ACR_NAME ?= $(COMMON_NAME)$(NAME_SUFFIX)
 endif
@@ -30,7 +31,18 @@ CUSTOM_VNET_NAME ?= $(AZURE_CLUSTER_NAME)-vnet
 CUSTOM_SUBNET_NAME ?= nodesubnet
 
 PROVISION_MODE ?= aksscriptless
-AKS_MACHINES_POOL_NAME ?= testmpool
+AKS_MACHINES_POOL_NAME ?= mpool
+# pre-pull base images for skaffold/ko build, as a workaround for https://github.com/GoogleContainerTools/skaffold/issues/10106
+KO_BASE_IMAGE ?= mcr.microsoft.com/azurelinux/distroless/base:3.0.20260909@sha256:4377af4aa7a810b7d59f691eae5066895a71aa3eee4cfb4eba527bbebff16479
+KO_BASE_IMAGE_AMD64 ?= mcr.microsoft.com/azurelinux/distroless/base:3.0.20260909-amd64@sha256:0198b6345e0aeffd6c2e455ebc4c74b1d644ac1dfcb5aa5236972f17fd281f27
+KO_BASE_IMAGE_ARM64 ?= mcr.microsoft.com/azurelinux/distroless/base:3.0.20260909-arm64@sha256:9735ffd118503eea4887885a28fdc0b1d678afd1867b0e10ca3b2e069245cb06
+export KOCACHE ?= $(or $(RUNNER_TEMP),/tmp)/ko-cache
+
+# Windows admin credentials, used when creating a Windows-capable test cluster
+# (az-mkaks-windows). The AKS RP sources Windows node admin credentials from the cluster's
+# windowsProfile, so the cluster must be created with these. Override for non-throwaway use.
+WINDOWS_ADMIN_USERNAME ?= azureuser
+WINDOWS_ADMIN_PASSWORD ?= Repl@ceMe-W1ndows-E2E!
 
 .DEFAULT_GOAL := help	# make without arguments will show help
 
@@ -114,6 +126,13 @@ az-upstream-e2etests: az-cleanenv ## Run upstream e2etests
 ci-mkcluster-all:              az-create-workload-msi az-mkaks-cilium              az-create-federated-cred $(AZ_ALL_PERMS)
 
 ci-mkcluster-all-userassigned: az-create-workload-msi az-mkaks-cilium-userassigned az-create-federated-cred $(AZ_ALL_PERMS)
+
+# Windows e2e needs a dedicated cluster: Windows does not support the Cilium dataplane used by the
+# default CI cluster, so this uses az-mkaks-windows (Azure CNI overlay + windowsProfile). The Windows
+# suite only provisions via the AKS Machine API, so invoke with PROVISION_MODE=aksmachineapi (which
+# pulls the machine perms + machines pool into AZ_ALL_PERMS) and AKS_MACHINES_POOL_NAME set to a name
+# <= 6 chars (Windows machine-name budget for a custom pool).
+ci-mkcluster-all-windows:      az-create-workload-msi az-mkaks-windows             az-create-federated-cred $(AZ_ALL_PERMS)
 
 ci-install: az-configure-values az-build az-run
 
@@ -228,6 +247,24 @@ az-mkaks-overlay: az-mkacr ## Create test AKS cluster (with --network-plugin-mod
 	$(MAKE) az-creds
 	skaffold config set default-repo $(AZURE_ACR_NAME).$(AZURE_ACR_SUFFIX)/karpenter
 
+az-mkaks-windows: az-mkacr ## Create a Windows-capable test AKS cluster (Azure CNI overlay + windowsProfile) for the Windows e2e suite
+	@hack/deploy/check-cluster-exists.sh $(AZURE_CLUSTER_NAME) $(AZURE_RESOURCE_GROUP) az-mkaks-windows; \
+	EXIT_CODE=$$?; \
+	if [ $$EXIT_CODE -eq 1 ]; then \
+		az aks create --name $(AZURE_CLUSTER_NAME) --resource-group $(AZURE_RESOURCE_GROUP) --attach-acr $(AZURE_ACR_NAME) \
+			--enable-managed-identity --node-count 3 --generate-ssh-keys \
+			--network-plugin azure --network-plugin-mode overlay \
+			--windows-admin-username $(WINDOWS_ADMIN_USERNAME) --windows-admin-password '$(WINDOWS_ADMIN_PASSWORD)' \
+			--enable-oidc-issuer --enable-workload-identity --nodepool-taints "CriticalAddonsOnly=true:NoSchedule" \
+			$(if $(AZURE_VM_SIZE),--node-vm-size $(AZURE_VM_SIZE)) \
+			$(if $(K8S_VERSION),--kubernetes-version $(K8S_VERSION)) \
+			--tags "make-command=az-mkaks-windows"; \
+	elif [ $$EXIT_CODE -eq 2 ]; then \
+		exit 1; \
+	fi
+	$(MAKE) az-creds
+	skaffold config set default-repo $(AZURE_ACR_NAME).$(AZURE_ACR_SUFFIX)/karpenter
+
 az-mkaks-perftest: az-mkacr ## Create test AKS cluster (with Azure Overlay, larger system pool VMs and larger pod-cidr)
 	@hack/deploy/check-cluster-exists.sh $(AZURE_CLUSTER_NAME) $(AZURE_RESOURCE_GROUP) az-mkaks-perftest; \
 	EXIT_CODE=$$?; \
@@ -313,6 +350,7 @@ az-perm-sig: ## Create role assignments when testing with SIG images
 	$(eval KARPENTER_USER_ASSIGNED_CLIENT_ID=$(shell az identity show --resource-group "${AZURE_RESOURCE_GROUP}" --name "${AZURE_KARPENTER_USER_ASSIGNED_IDENTITY_NAME}" --query 'principalId' --output tsv))
 	az role assignment create --assignee-object-id $(KARPENTER_USER_ASSIGNED_CLIENT_ID) --assignee-principal-type "ServicePrincipal" --role "Reader" --scope /subscriptions/$(AZURE_SIG_SUBSCRIPTION_ID)/resourceGroups/AKS-Ubuntu/providers/Microsoft.Compute/galleries/AKSUbuntu
 	az role assignment create --assignee-object-id $(KARPENTER_USER_ASSIGNED_CLIENT_ID) --assignee-principal-type "ServicePrincipal" --role "Reader" --scope /subscriptions/$(AZURE_SIG_SUBSCRIPTION_ID)/resourceGroups/AKS-AzureLinux/providers/Microsoft.Compute/galleries/AKSAzureLinux
+	az role assignment create --assignee-object-id $(KARPENTER_USER_ASSIGNED_CLIENT_ID) --assignee-principal-type "ServicePrincipal" --role "Reader" --scope /subscriptions/$(AZURE_SIG_SUBSCRIPTION_ID)/resourceGroups/AKS-Windows/providers/Microsoft.Compute/galleries/AKSWindows
 
 az-perm-subnet-custom: az-perm ## Create role assignments to let Karpenter manage VMs and Network (custom VNet)
 	$(eval VNET_SUBNET_ID=$(shell az aks show --name $(AZURE_CLUSTER_NAME) --resource-group $(AZURE_RESOURCE_GROUP) --query "agentPoolProfiles[0].vnetSubnetId" --output tsv))
@@ -339,7 +377,14 @@ az-aks-check-acr:
 
 az-build: ## Build the Karpenter controller and webhook images using skaffold build (which uses ko build)
 	az acr login -n $(AZURE_ACR_NAME)
+	$(MAKE) az-ko-prewarm-base
 	skaffold build
+
+az-ko-prewarm-base: ## Prewarm ko's base image cache for skaffold/ko builds
+	mkdir -p $(KOCACHE)
+	crane pull --format=oci $(KO_BASE_IMAGE) $(KOCACHE)/img
+	crane pull --format=oci $(KO_BASE_IMAGE_AMD64) $(KOCACHE)/img
+	crane pull --format=oci $(KO_BASE_IMAGE_ARM64) $(KOCACHE)/img
 
 az-creds: ## Get cluster credentials
 	az aks get-credentials --name $(AZURE_CLUSTER_NAME) --resource-group $(AZURE_RESOURCE_GROUP) --overwrite-existing
@@ -367,18 +412,20 @@ az-mon-deploy: ## Deploy monitoring stack (w/o node-exporter)
 	helm repo add grafana-charts https://grafana.github.io/helm-charts
 	helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
 	helm repo update
-	kubectl create namespace monitoring || true
-	helm install --namespace monitoring prometheus prometheus-community/prometheus \
+	# Create the namespace if not extant; NOP otherwise
+	kubectl create namespace monitoring --dry-run=client -o yaml | kubectl apply -f -
+	# We use `helm upgrade --install` to avoid errors if the release already exists, and to allow for upgrades of the release if it does exist.
+	helm upgrade --install --namespace monitoring prometheus prometheus-community/prometheus \
 		--values hack/monitoring/prometheus-values.yaml
-	helm install --namespace monitoring pyroscope grafana-charts/pyroscope \
+	helm upgrade --install --namespace monitoring pyroscope grafana-charts/pyroscope \
 		--set pyroscope.extraArgs.'usage-stats\.enabled'=false
-	helm install --namespace monitoring grafana grafana-charts/grafana \
+	helm upgrade --install --namespace monitoring grafana grafana-charts/grafana \
 		--values hack/monitoring/grafana-values.yaml \
 		--set env.GF_AUTH_ANONYMOUS_ENABLED=true \
 		--set env.GF_AUTH_ANONYMOUS_ORG_ROLE=Admin
 
 az-mon-access: ## Get Grafana admin password and forward port
-	@echo Consider running port forward outside of codespace ...
+	@echo "Consider running port forward outside of codespace ..."
 	$(eval POD_NAME=$(shell kubectl get pods --namespace monitoring -l "app.kubernetes.io/name=grafana,app.kubernetes.io/instance=grafana" -o jsonpath="{.items[0].metadata.name}"))
 	kubectl port-forward --namespace monitoring $(POD_NAME) 3000
 

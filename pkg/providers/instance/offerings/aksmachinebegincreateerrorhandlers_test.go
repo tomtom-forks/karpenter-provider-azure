@@ -55,6 +55,11 @@ func (b *aksMachineBeginCreateErrorTestCaseBuilder) withZoneAndCapacity(zone, ca
 	return b
 }
 
+func (b *aksMachineBeginCreateErrorTestCaseBuilder) withCapacityReservationGroup(id string) *aksMachineBeginCreateErrorTestCaseBuilder {
+	b.tc.capacityReservationGroupID = id
+	return b
+}
+
 func (b *aksMachineBeginCreateErrorTestCaseBuilder) withHandlableError(code, message string) *aksMachineBeginCreateErrorTestCaseBuilder {
 	b.tc.he = &HandlableError{Code: code, Message: message}
 	return b
@@ -65,8 +70,18 @@ func (b *aksMachineBeginCreateErrorTestCaseBuilder) expectError(err error) *aksM
 	return b
 }
 
+func (b *aksMachineBeginCreateErrorTestCaseBuilder) expectReason(reason string) *aksMachineBeginCreateErrorTestCaseBuilder {
+	b.tc.expectedReason = reason
+	return b
+}
+
 func (b *aksMachineBeginCreateErrorTestCaseBuilder) expectUnavailable(offerings ...offeringToCheck) *aksMachineBeginCreateErrorTestCaseBuilder {
 	b.tc.expectedUnavailableOfferingsInformation = offerings
+	return b
+}
+
+func (b *aksMachineBeginCreateErrorTestCaseBuilder) expectAvailable(offerings ...offeringToCheck) *aksMachineBeginCreateErrorTestCaseBuilder {
+	b.tc.expectedAvailableOfferingsInformation = offerings
 	return b
 }
 
@@ -80,14 +95,29 @@ type aksMachineBeginCreateErrorTestCase struct {
 	originalRequestSKU                      *skewer.SKU
 	zone                                    string
 	capacityType                            string
+	capacityReservationGroupID              string
 	he                                      *HandlableError
 	expectedErr                             error
+	expectedReason                          string
 	expectedUnavailableOfferingsInformation []offeringToCheck
 	expectedAvailableOfferingsInformation   []offeringToCheck
 }
 
 func newTestAKSMachineBeginCreateErrorHandler() *AKSMachineBeginCreateErrorHandler {
 	return NewAKSMachineBeginCreateErrorHandler(cache.NewUnavailableOfferings())
+}
+
+// nodePublicIPBeginCreateErrorTestCase builds a case for an AKS rejection caused by the NodeClass's node
+// public IP settings. These are configuration errors, not capacity errors: they must stay unhandled,
+// so AKS's code and message reach the NodeClaim, and they must not mark any offering unavailable.
+func nodePublicIPBeginCreateErrorTestCase(name, code, message string) aksMachineBeginCreateErrorTestCase {
+	return newAKSMachineBeginCreateErrorTestCase(name+" - node public IP - not handled").
+		withInstanceType(zone1OnDemand, zone2Spot, zone3OnDemand, regionalSpot).
+		withZoneAndCapacity(testZone2, karpv1.CapacityTypeSpot).
+		withHandlableError(code, message).
+		expectError(nil).
+		expectAvailable(allDefaultTestOfferingInfo()...).
+		build()
 }
 
 func setupAKSMachineBeginCreateErrorTestCases() []aksMachineBeginCreateErrorTestCase {
@@ -97,6 +127,7 @@ func setupAKSMachineBeginCreateErrorTestCases() []aksMachineBeginCreateErrorTest
 			withZoneAndCapacity(testZone2, karpv1.CapacityTypeOnDemand).
 			withHandlableError("VMSizeNotSupported", "hello").
 			expectError(fmt.Errorf(errMsgSKUNotAvailableForSubscriptionFmt, testInstanceName)).
+			expectReason(SKUNotAvailableReason).
 			expectUnavailable(
 				defaultTestOfferingInfo(testZone2, karpv1.CapacityTypeOnDemand),
 				defaultTestOfferingInfo(testZone2, karpv1.CapacityTypeSpot),
@@ -107,12 +138,26 @@ func setupAKSMachineBeginCreateErrorTestCases() []aksMachineBeginCreateErrorTest
 			).
 			build(),
 
+		newAKSMachineBeginCreateErrorTestCase("VMSizeNotSupported for a capacity reservation group").
+			withInstanceType(zone2OnDemand, zone3OnDemand).
+			withZoneAndCapacity(testZone2, karpv1.CapacityTypeOnDemand).
+			withCapacityReservationGroup(testCapacityReservationGroupID).
+			withHandlableError("VMSizeNotSupported", "not supported").
+			expectError(fmt.Errorf(errMsgSKUNotAvailableForSubscriptionFmt, testInstanceName)).
+			expectReason(SKUNotAvailableReason).
+			expectUnavailable(
+				defaultTestOfferingInfo(testZone2, karpv1.CapacityTypeOnDemand),
+				defaultTestOfferingInfo(testZone3, karpv1.CapacityTypeOnDemand),
+			).
+			build(),
+
 		newAKSMachineBeginCreateErrorTestCase("BadRequest - VM size not supported for subscription").
 			withInstanceType(zone2OnDemand, zone3Spot, regionalSpot).
 			withZoneAndCapacity(testZone2, karpv1.CapacityTypeSpot).
 			withHandlableError("BadRequest",
 				fmt.Sprintf("Virtual Machine size: '%s' is not supported for subscription sub-123 in location 'westus'. Please refer to aka.ms/aks/vm-size-selector to find supported VM sizes in location 'westus'.", testInstanceName)).
 			expectError(fmt.Errorf(errMsgSKUNotAvailableForSubscriptionFmt, testInstanceName)).
+			expectReason(SKUNotAvailableReason).
 			expectUnavailable(
 				defaultTestOfferingInfo(testZone2, karpv1.CapacityTypeOnDemand),
 				defaultTestOfferingInfo(testZone2, karpv1.CapacityTypeSpot),
@@ -153,6 +198,13 @@ func setupAKSMachineBeginCreateErrorTestCases() []aksMachineBeginCreateErrorTest
 			withHandlableError("InternalServerError", "Azure service temporarily unavailable").
 			expectError(nil).
 			build(),
+
+		nodePublicIPBeginCreateErrorTestCase("LinkedAuthorizationFailed",
+			"LinkedAuthorizationFailed", "The client 'clientID' with object id 'objectID' has permission to perform action 'Microsoft.ContainerService/managedClusters/agentPools/machines/write' on scope 'machineID'; however, it does not have permission to perform action(s) 'Microsoft.Network/publicIPPrefixes/join/action' on the linked scope(s) 'prefixID' (respectively) or the linked scope(s) are invalid."),
+		nodePublicIPBeginCreateErrorTestCase("UnsupportedIPTagType",
+			"UnsupportedIPTagType", "IP tag type UnknownTagType is not supported. Supported values are FirstPartyUsage, NetworkDomain and RoutingPreference."),
+		nodePublicIPBeginCreateErrorTestCase("GetPublicIPPrefixByResourceIDError",
+			"GetPublicIPPrefixByResourceIDError", "Failed to get public IP prefix object by ID prefixID."),
 	}
 }
 
@@ -161,7 +213,6 @@ func TestHandleMachineAPISyncErrors(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.testName, func(t *testing.T) {
-			g := NewWithT(t)
 			handler := newTestAKSMachineBeginCreateErrorHandler()
 
 			err := handler.Handle(
@@ -170,15 +221,12 @@ func TestHandleMachineAPISyncErrors(t *testing.T) {
 				tc.instanceType,
 				tc.zone,
 				tc.capacityType,
+				tc.capacityReservationGroupID,
 				tc.he,
 			)
 
-			if tc.expectedErr == nil {
-				g.Expect(err).To(BeNil())
-			} else {
-				g.Expect(err).To(Equal(tc.expectedErr))
-			}
-			assertOfferingsState(t, handler.unavailableOfferings, tc.expectedUnavailableOfferingsInformation, tc.expectedAvailableOfferingsInformation)
+			assertHandledError(t, err, tc.expectedErr, tc.expectedReason)
+			assertOfferingsState(t, handler.unavailableOfferings, tc.capacityReservationGroupID, tc.expectedUnavailableOfferingsInformation, tc.expectedAvailableOfferingsInformation)
 		})
 	}
 }

@@ -12,6 +12,12 @@ KARPENTER_NAMESPACE ?= kube-system
 # TODO: revisit testing tools (temporarily excluded here, for make verify)
 MOD_DIRS = $(shell find . -name go.mod -type f ! -path "./test/*" | xargs dirname)
 KARPENTER_CORE_DIR = $(shell go list -m -f '{{ .Dir }}' sigs.k8s.io/karpenter)
+KARPENTER_CORE_CRDS = \
+	autoscaling.x-k8s.io_capacitybuffers.yaml \
+	karpenter.sh_nodeclaims.yaml \
+	karpenter.sh_nodeoverlays.yaml \
+	karpenter.sh_nodepools.yaml
+SUPPORTED_CRDS = karpenter.azure.com_aksnodeclasses.yaml $(KARPENTER_CORE_CRDS)
 
 # TEST_SUITE enables you to select a specific test suite directory to run "make e2etests" or "make test" against
 TEST_SUITE ?= "..."
@@ -91,12 +97,19 @@ verify: tidy download ## Verify code. Includes dependencies, linting, formatting
 	# make az-swagger-generate-clients-raw
 	go generate ./...
 	hack/boilerplate.sh
-	cp $(KARPENTER_CORE_DIR)/pkg/apis/crds/* pkg/apis/crds
+	# Copy pinned core CRDs and make the local copies writable
+	cp -f $(addprefix $(KARPENTER_CORE_DIR)/pkg/apis/crds/,$(KARPENTER_CORE_CRDS)) pkg/apis/crds
+	chmod u+w $(addprefix pkg/apis/crds/,$(KARPENTER_CORE_CRDS))
+	# Apply provider-specific CRD changes before packaging them
 	hack/validation/kubelet.sh
 	hack/validation/labels.sh
 	hack/validation/requirements.sh
+	hack/validation/taints.sh
 	hack/mutation/kubectl_get_ux.sh
-	cp pkg/apis/crds/* charts/karpenter-crd/templates
+	# Package the adjusted CRDs, then validate CapacityBuffer chart delivery
+	cp -f $(addprefix pkg/apis/crds/,$(SUPPORTED_CRDS)) charts/karpenter-crd/templates
+	chmod u+w $(addprefix charts/karpenter-crd/templates/,$(SUPPORTED_CRDS))
+	hack/validation/capacitybuffer.sh
 	hack/github/dependabot.sh
 	$(foreach dir,$(MOD_DIRS),cd $(dir) && golangci-lint-custom run $(newline))
 	@git diff --quiet ||\
@@ -118,7 +131,11 @@ licenses: download ## Verifies dependency licenses
 	go-licenses csv ./... > $$LICENSEFILE && \
 	! grep -v -e 'MIT' -e 'Apache-2.0' -e 'BSD-3-Clause' -e 'BSD-2-Clause' -e 'ISC' -e 'MPL-2.0' $$LICENSEFILE
 
-codegen: codegen-pricing codegen-locations codegen-skugen codegen-allazureskus ## Auto generate files based on Azure API responses
+codegen: codegen-prod codegen-test ## Auto generate files based on Azure API responses
+
+codegen-prod: codegen-pricing codegen-allazuresku ## Generate codegen data used in production
+
+codegen-test: codegen-locations codegen-skugen ## Generate codegen test data
 
 codegen-pricing: ## Generate pricing data
 	./hack/codegen.sh pricing
@@ -153,3 +170,23 @@ define newline
 
 
 endef
+
+# Announce all explicit targets as they run to allow easier tracing of issues
+#
+# Every target is preceded by a blank line and a header like this:
+# ----- <target> ----
+#
+# NOTE: This block must be at the very end of the entrypoint Makefile so it's parsed last
+
+ANNOUNCED_TARGETS := $(filter-out FORCE .PHONY,$(shell awk -F: \
+    '/^[a-zA-Z0-9_.\/-]+([[:space:]]+[a-zA-Z0-9_.\/-]+)*[[:space:]]*:/ \
+    { print $$1 }' $(MAKEFILE_LIST)))
+
+.PHONY: FORCE
+
+$(ANNOUNCED_TARGETS): %: | .announce-%
+
+.announce-%: FORCE
+	@printf '\n----- %s -----\n' '$*'
+
+FORCE:

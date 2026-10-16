@@ -20,6 +20,7 @@ import (
 	"bytes"
 	"encoding/base64"
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/blang/semver/v4"
@@ -50,6 +51,11 @@ type AKS struct {
 }
 
 var _ Bootstrapper = (*AKS)(nil) // assert AKS implements Bootstrapper
+
+const (
+	nodeHardeningKubeReservedCgroup   = "/kubereserved.slice"
+	nodeHardeningSystemReservedCgroup = "/system.slice"
+)
 
 func (a AKS) Script() (string, error) {
 	bootstrapScript, err := a.aksBootstrapScript()
@@ -183,6 +189,12 @@ type NodeBootstrapVariables struct {
 	CSEInstallFilepath                      string   // s   static
 	CSEDistroInstallFilepath                string   // s   static
 	CSEConfigFilepath                       string   // s   static
+	CSEConfigGPUScriptFilepath              string   // s   static
+	CSEConfigLocalDNSScriptFilepath         string   // s   static
+	CSEConfigKubeletScriptFilepath          string   // s   static
+	CSEConfigNetworkScriptFilepath          string   // s   static
+	CSEConfigAddonsScriptFilepath           string   // s   static
+	CSEConfigChronyScriptFilepath           string   // s   static
 	AzurePrivateRegistryServer              string   // c   user input
 	HasCustomSearchDomain                   bool     // c   user input
 	CustomSearchDomainFilepath              string   // s   static
@@ -245,6 +257,11 @@ func (a AKS) aksBootstrapScript() (string, error) {
 
 // Download URL for KUBE_BINARY_URL publishes each k8s version in the URL.
 func kubeBinaryURL(kubernetesVersion, cpuArch string) string {
+	// Versions 1.34+ use a different binary path for kubectl/kubelet. AgentBaker CSE has that path baked in to the image
+	// so we don't need to specify the URL.
+	if semver.MustParse(kubernetesVersion).Minor >= 34 {
+		return ""
+	}
 	return fmt.Sprintf("%s/kubernetes/v%s/binaries/kubernetes-node-linux-%s.tar.gz", globalAKSMirror, kubernetesVersion, cpuArch)
 }
 
@@ -362,9 +379,12 @@ func (a AKS) applyOptions(nbv *NodeBootstrapVariables) {
 	nodeclaimKubeletConfig := kubeletConfigToMap(a.KubeletConfig)
 	kubeletFlags = lo.Assign(kubeletFlags, nodeclaimKubeletConfig)
 
-	// stringify kubelet flags (including taints)
-	nbv.KubeletFlags = strings.Join(lo.MapToSlice(kubeletFlags, func(k, v string) string {
-		return fmt.Sprintf("%s=%s", k, v)
+	// stringify kubelet flags (including taints); sort by flag name so ordering is
+	// deterministic in the rendered customData.
+	flagNames := lo.Keys(kubeletFlags)
+	sort.Strings(flagNames)
+	nbv.KubeletFlags = strings.Join(lo.Map(flagNames, func(k string, _ int) string {
+		return fmt.Sprintf("%s=%s", k, kubeletFlags[k])
 	}), " ")
 }
 
@@ -399,6 +419,14 @@ func kubeletConfigToMap(kubeletConfig *KubeletConfiguration) map[string]string {
 	JoinParameterArgsToMap(args, "--eviction-soft-grace-period", lo.MapValues(kubeletConfig.EvictionSoftGracePeriod, func(v metav1.Duration, _ string) string {
 		return v.Duration.String()
 	}), "=")
+
+	if len(kubeletConfig.EnforceNodeAllocatable) > 0 {
+		args["--enforce-node-allocatable"] = strings.Join(kubeletConfig.EnforceNodeAllocatable, ",")
+		if lo.Contains(kubeletConfig.EnforceNodeAllocatable, "kube-reserved") && lo.Contains(kubeletConfig.EnforceNodeAllocatable, "system-reserved") {
+			args["--kube-reserved-cgroup"] = nodeHardeningKubeReservedCgroup
+			args["--system-reserved-cgroup"] = nodeHardeningSystemReservedCgroup
+		}
+	}
 
 	if kubeletConfig.EvictionMaxPodGracePeriod != nil {
 		args["--eviction-max-pod-grace-period"] = fmt.Sprintf("%d", lo.FromPtr(kubeletConfig.EvictionMaxPodGracePeriod))
@@ -440,11 +468,11 @@ func kubeletConfigToMap(kubeletConfig *KubeletConfiguration) map[string]string {
 // joinParameterArgsToMap joins a map of keys and values by their separator. The separator will sit between the
 // arguments in a comma-separated list i.e. arg1<sep>val1,arg2<sep>val2
 func JoinParameterArgsToMap[K comparable, V any](result map[string]string, name string, m map[K]V, separator string) {
-	var args []string
-
+	args := make([]string, 0, len(m))
 	for k, v := range m {
 		args = append(args, fmt.Sprintf("%v%s%v", k, separator, v))
 	}
+
 	if len(args) > 0 {
 		result[name] = strings.Join(args, ",")
 	}
