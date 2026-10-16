@@ -63,7 +63,6 @@ const (
 type instanceTypeParameters struct {
 	ImageFamily              string
 	OSDiskSizeGB             *int32 // nil means auto-sized per SKU
-	OSDiskSizeDynamic        bool
 	OSDiskType               v1beta1.OSDiskType
 	MaxPods                  int32
 	EncryptionAtHost         bool
@@ -168,7 +167,6 @@ func (p *DefaultProvider) List(
 	instanceTypeParams := &instanceTypeParameters{
 		ImageFamily:              lo.FromPtr(nodeClass.Spec.ImageFamily),
 		OSDiskSizeGB:             nodeClass.Spec.OSDiskSizeGB,
-		OSDiskSizeDynamic:        nodeClass.Spec.OSDiskSizeDynamic,
 		OSDiskType:               lo.FromPtr(nodeClass.Spec.OSDiskType),
 		MaxPods:                  utils.GetMaxPods(nodeClass, opts.NetworkPlugin, opts.NetworkPluginMode),
 		EncryptionAtHost:         nodeClass.GetEncryptionAtHost(),

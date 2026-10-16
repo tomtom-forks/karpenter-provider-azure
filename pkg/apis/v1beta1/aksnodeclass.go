@@ -181,10 +181,6 @@ type AKSNodeClassSpec struct {
 	// +kubebuilder:validation:Maximum=2048
 	// +optional
 	OSDiskSizeGB *int32 `json:"osDiskSizeGB,omitempty"`
-	// +kubebuilder:default=false
-	// +kubebuilder:validation:Optional
-	// OSDiskSizeDynamic is enable dynamic os disk size based on SKU max allowed disk
-	OSDiskSizeDynamic bool `json:"OSDiskSizeDynamic,omitempty"`
 	// CustomImageTerm is for user defined Azure Custom Images
 	// +optional
 	CustomImageTerm CustomImageTerm `json:"customImageTerm,omitempty" hash:"ignore"`

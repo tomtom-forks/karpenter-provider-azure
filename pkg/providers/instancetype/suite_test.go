@@ -1280,7 +1280,7 @@ var _ = Describe("InstanceType Provider", func() {
 			Context("ResolveOSDiskProfileFromSKU(sku *skewer.SKU, requestedOSDiskSizeGB *int32) -> OSDiskProfile", func() {
 				DescribeTable("should resolve OS disk size and type",
 					func(sku *skewer.SKU, requestedOSDiskSizeGB *int32, expected instancetype.OSDiskProfile) {
-						profile := instancetype.ResolveOSDiskProfileFromSKU(sku, requestedOSDiskSizeGB, "", false, false)
+						profile := instancetype.ResolveOSDiskProfileFromSKU(sku, requestedOSDiskSizeGB, "", false)
 						Expect(profile).To(Equal(expected))
 					},
 					// explicit size: used as-is; ephemeral if it fits within the SKU-supported size
@@ -1310,7 +1310,7 @@ var _ = Describe("InstanceType Provider", func() {
 				)
 				It("should reserve Trusted Launch storage when auto-sizing", func() {
 					profile := instancetype.ResolveOSDiskProfileFromSKU(
-						fake.MakeSKU("Standard_D64s_v3"), nil, "", true, false,
+						fake.MakeSKU("Standard_D64s_v3"), nil, "", true,
 					)
 					Expect(profile).To(Equal(instancetype.OSDiskProfile{
 						SizeGB:    1599,
@@ -1320,7 +1320,7 @@ var _ = Describe("InstanceType Provider", func() {
 				})
 				It("should honor an explicit Managed type when size is unset", func() {
 					profile := instancetype.ResolveOSDiskProfileFromSKU(
-						fake.MakeSKU("Standard_D64s_v3"), nil, v1beta1.OSDiskTypeManaged, false, false,
+						fake.MakeSKU("Standard_D64s_v3"), nil, v1beta1.OSDiskTypeManaged, false,
 					)
 					Expect(profile).To(Equal(instancetype.OSDiskProfile{SizeGB: 1024, Type: armcontainerservice.OSDiskTypeManaged}))
 				})
@@ -1332,7 +1332,7 @@ var _ = Describe("InstanceType Provider", func() {
 								{Name: lo.ToPtr(skewer.VCPUs), Value: lo.ToPtr(strconv.Itoa(vcpus))},
 							},
 						}
-						profile := instancetype.ResolveOSDiskProfileFromSKU(sku, nil, "", false, false)
+						profile := instancetype.ResolveOSDiskProfileFromSKU(sku, nil, "", false)
 						Expect(profile).To(Equal(instancetype.OSDiskProfile{SizeGB: expectedSizeGB, Type: armcontainerservice.OSDiskTypeManaged}))
 					},
 					Entry("2 vCPUs -> 128GB", 2, int32(128)),
@@ -1344,60 +1344,6 @@ var _ = Describe("InstanceType Provider", func() {
 					Entry("64 vCPUs -> 1024GB", 64, int32(1024)),
 					Entry("128 vCPUs -> 1024GB", 128, int32(1024)),
 				)
-			})
-			// TomTom: OSDiskSizeDynamic. Expected sizes match the fork's pre-v1.14 behavior on our runner SKUs.
-			Context("ResolveOSDiskProfileFromSKU with OSDiskSizeDynamic", func() {
-				DescribeTable("should size the ephemeral OS disk to the local disk capacity",
-					func(sku *skewer.SKU, expected instancetype.OSDiskProfile) {
-						profile := instancetype.ResolveOSDiskProfileFromSKU(sku, lo.ToPtr[int32](50), "", false, true)
-						Expect(profile).To(Equal(expected))
-					},
-					Entry("resource disk below 128GiB stays ephemeral (Standard_D2ads_v5)",
-						dynamicDiskTestSKU(map[string]string{"SupportedEphemeralOSDiskPlacements": "ResourceDisk", "MaxResourceVolumeMB": "76800"}),
-						instancetype.OSDiskProfile{SizeGB: 75, Type: armcontainerservice.OSDiskTypeEphemeral, Placement: lo.ToPtr(armcompute.DiffDiskPlacementResourceDisk)}),
-					Entry("single NVMe disk (Standard_D2pds_v6)",
-						dynamicDiskTestSKU(map[string]string{"SupportedEphemeralOSDiskPlacements": "NvmeDisk", "MaxResourceVolumeMB": "0", "NvmeDiskSizeInMiB": "112640", "NvmeSizePerDiskInMiB": "112640"}),
-						instancetype.OSDiskProfile{SizeGB: 110, Type: armcontainerservice.OSDiskTypeEphemeral, Placement: lo.ToPtr(armcompute.DiffDiskPlacementNvmeDisk)}),
-					Entry("two NVMe disks span the total size (Standard_D16ads_v6)",
-						dynamicDiskTestSKU(map[string]string{"SupportedEphemeralOSDiskPlacements": "NvmeDisk", "MaxResourceVolumeMB": "0", "NvmeDiskSizeInMiB": "901120", "NvmeSizePerDiskInMiB": "450560"}),
-						instancetype.OSDiskProfile{SizeGB: 880, Type: armcontainerservice.OSDiskTypeEphemeral, Placement: lo.ToPtr(armcompute.DiffDiskPlacementNvmeDisk)}),
-					Entry("four NVMe disks span the total size (Standard_D32pds_v6)",
-						dynamicDiskTestSKU(map[string]string{"SupportedEphemeralOSDiskPlacements": "NvmeDisk", "MaxResourceVolumeMB": "0", "NvmeDiskSizeInMiB": "1802240", "NvmeSizePerDiskInMiB": "450560"}),
-						instancetype.OSDiskProfile{SizeGB: 1760, Type: armcontainerservice.OSDiskTypeEphemeral, Placement: lo.ToPtr(armcompute.DiffDiskPlacementNvmeDisk)}),
-					Entry("NVMe total is capped at the ephemeral OS disk maximum (Standard_D96ads_v6)",
-						dynamicDiskTestSKU(map[string]string{"SupportedEphemeralOSDiskPlacements": "NvmeDisk", "MaxResourceVolumeMB": "0", "NvmeDiskSizeInMiB": "5406720", "NvmeSizePerDiskInMiB": "901120"}),
-						instancetype.OSDiskProfile{SizeGB: 2040, Type: armcontainerservice.OSDiskTypeEphemeral, Placement: lo.ToPtr(armcompute.DiffDiskPlacementNvmeDisk)}),
-					Entry("cache disk is preferred over resource disk (Standard_NV6ads_A10_v5)",
-						dynamicDiskTestSKU(map[string]string{"SupportedEphemeralOSDiskPlacements": "ResourceDisk,CacheDisk", "CachedDiskBytes": "154618822656", "MaxResourceVolumeMB": "184320"}),
-						instancetype.OSDiskProfile{SizeGB: 143, Type: armcontainerservice.OSDiskTypeEphemeral, Placement: lo.ToPtr(armcompute.DiffDiskPlacementCacheDisk)}),
-				)
-				It("should reserve Trusted Launch storage", func() {
-					sku := dynamicDiskTestSKU(map[string]string{"SupportedEphemeralOSDiskPlacements": "ResourceDisk", "MaxResourceVolumeMB": "76800"})
-					profile := instancetype.ResolveOSDiskProfileFromSKU(sku, nil, "", true, true)
-					Expect(profile.SizeGB).To(Equal(int32(74)))
-				})
-				It("should fall back to the requested size on a managed disk when ephemeral is unsupported", func() {
-					sku := dynamicDiskTestSKU(map[string]string{"EphemeralOSDiskSupported": "False", "MaxResourceVolumeMB": "76800"})
-					profile := instancetype.ResolveOSDiskProfileFromSKU(sku, lo.ToPtr[int32](50), "", false, true)
-					Expect(profile).To(Equal(instancetype.OSDiskProfile{SizeGB: 50, Type: armcontainerservice.OSDiskTypeManaged}))
-				})
-				It("should honor an explicit Managed type", func() {
-					sku := dynamicDiskTestSKU(map[string]string{"SupportedEphemeralOSDiskPlacements": "ResourceDisk", "MaxResourceVolumeMB": "76800"})
-					profile := instancetype.ResolveOSDiskProfileFromSKU(sku, lo.ToPtr[int32](50), v1beta1.OSDiskTypeManaged, false, true)
-					Expect(profile).To(Equal(instancetype.OSDiskProfile{SizeGB: 50, Type: armcontainerservice.OSDiskTypeManaged}))
-				})
-				It("should report ephemeral-storage capacity matching the dynamic OS disk size", func() {
-					nodeClass.Spec.OSDiskSizeGB = lo.ToPtr[int32](50)
-					nodeClass.Spec.OSDiskSizeDynamic = true
-					instanceTypes, err := azureEnv.InstanceTypesProvider.List(ctx, nodeClass)
-					Expect(err).ToNot(HaveOccurred())
-					capacityByName := map[string]string{}
-					for _, it := range instanceTypes {
-						capacityByName[it.Name] = it.Capacity.StorageEphemeral().String()
-					}
-					Expect(capacityByName).To(HaveKeyWithValue("Standard_D2s_v3", "49G"))  // ephemeral, below upstream's 128GiB auto-size minimum
-					Expect(capacityByName).To(HaveKeyWithValue("Standard_D2as_v6", "50G")) // no ephemeral support, requested managed size
-				})
 			})
 			Context("Capacity", func() {
 				It("should report ephemeral-storage capacity matching the auto-resolved OS disk size", func() {
@@ -4745,7 +4691,6 @@ func resolveOSDiskProfile(sku *skewer.SKU, nodeClass *v1beta1.AKSNodeClass) inst
 		nodeClass.Spec.OSDiskSizeGB,
 		lo.FromPtr(nodeClass.Spec.OSDiskType),
 		nodeClass.IsTrustedLaunchEnabled(),
-		nodeClass.Spec.OSDiskSizeDynamic,
 	)
 }
 
@@ -4877,18 +4822,4 @@ func ExpectKubeletNodeLabelsNotInCustomData(vm *armcompute.VirtualMachine, key s
 	// Extract and check KUBELET_NODE_LABELS contains the expected label
 	kubeletNodeLabels := ExpectKubeletNodeLabelsPassed(decodedString)
 	Expect(kubeletNodeLabels).ToNot(ContainSubstring(fmt.Sprintf("%s=%s", key, value)))
-}
-
-func dynamicDiskTestSKU(capabilities map[string]string) *skewer.SKU {
-	sku := &skewer.SKU{
-		Name: lo.ToPtr("Standard_Test"),
-		Capabilities: &[]compute.ResourceSkuCapabilities{
-			{Name: lo.ToPtr(skewer.VCPUs), Value: lo.ToPtr("2")},
-			{Name: lo.ToPtr("EphemeralOSDiskSupported"), Value: lo.ToPtr("True")},
-		},
-	}
-	for name, value := range capabilities {
-		sku = withSKUCapability(sku, name, value)
-	}
-	return sku
 }

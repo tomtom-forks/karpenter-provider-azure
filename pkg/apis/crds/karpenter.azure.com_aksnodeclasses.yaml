@@ -60,11 +60,6 @@ spec:
               spec is the top level specification for the AKS Karpenter Provider.
               This will contain configuration necessary to launch instances in AKS.
             properties:
-              OSDiskSizeDynamic:
-                default: false
-                description: OSDiskSizeDynamic is enable dynamic os disk size based
-                  on SKU max allowed disk
-                type: boolean
               artifactStreaming:
                 description: |-
                   artifactStreaming configures artifact streaming for provisioned nodes.
@@ -1480,11 +1475,6 @@ spec:
               spec is the top level specification for the AKS Karpenter Provider.
               This will contain configuration necessary to launch instances in AKS.
             properties:
-              OSDiskSizeDynamic:
-                default: false
-                description: OSDiskSizeDynamic is enable dynamic os disk size based
-                  on SKU max allowed disk
-                type: boolean
               artifactStreaming:
                 description: |-
                   artifactStreaming configures artifact streaming for provisioned nodes.

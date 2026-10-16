@@ -325,7 +325,6 @@ func configureOSDisk(ctx context.Context, instanceTypeProvider instancetype.Prov
 		nodeClass.Spec.OSDiskSizeGB,
 		lo.FromPtr(nodeClass.Spec.OSDiskType),
 		nodeClass.IsTrustedLaunchEnabled(),
-		nodeClass.Spec.OSDiskSizeDynamic,
 	)
 	if err != nil {
 		return nil, nil, err

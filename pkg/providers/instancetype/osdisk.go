@@ -58,13 +58,12 @@ func ResolveOSDiskProfileFromInstanceType(
 	requestedOSDiskSizeGB *int32,
 	requestedOSDiskType v1beta1.OSDiskType,
 	trustedLaunch bool,
-	osDiskSizeDynamic bool,
 ) (OSDiskProfile, error) {
 	sku, err := provider.Get(ctx, instanceTypeName)
 	if err != nil {
 		return OSDiskProfile{}, err
 	}
-	return ResolveOSDiskProfileFromSKU(sku, requestedOSDiskSizeGB, requestedOSDiskType, trustedLaunch, osDiskSizeDynamic), nil
+	return ResolveOSDiskProfileFromSKU(sku, requestedOSDiskSizeGB, requestedOSDiskType, trustedLaunch), nil
 }
 
 // ResolveOSDiskProfileFromSKU resolves to-be-created instance's OS disk configuration based on VM size and other inputs.
@@ -73,14 +72,7 @@ func ResolveOSDiskProfileFromSKU(
 	requestedOSDiskSizeGB *int32,
 	requestedOSDiskType v1beta1.OSDiskType,
 	trustedLaunch bool,
-	osDiskSizeDynamic bool,
 ) OSDiskProfile {
-	if osDiskSizeDynamic && requestedOSDiskType != v1beta1.OSDiskTypeManaged {
-		if profile, ok := resolveDynamicOSDiskProfile(sku, trustedLaunch); ok {
-			return profile
-		}
-	}
-
 	if requestedOSDiskType == v1beta1.OSDiskTypeManaged {
 		// OSDiskType=Managed, OSDiskSize provided: use size as-is
 		if requestedOSDiskSizeGB != nil {
@@ -261,50 +253,6 @@ func listRankedEligibleEphemeralOSDiskPlacements(sku *skewer.SKU) []ephemeralOSD
 	candidates = appendEphemeralOSDiskPlacementIfEligible(candidates, resourceSupported, armcompute.DiffDiskPlacementResourceDisk, resourceBytes)
 	candidates = appendEphemeralOSDiskPlacementIfEligible(candidates, nvmeSupported, armcompute.DiffDiskPlacementNvmeDisk, nvmeBytes)
 	return candidates
-}
-
-// TomTom: resolveDynamicOSDiskProfile backs AKSNodeClass.Spec.OSDiskSizeDynamic. Unlike upstream
-// auto-sizing it has no 128 GiB minimum, and NVMe placements span all NVMe disks (NvmeDiskSizeInMiB).
-// Placement priority is NvmeDisk > CacheDisk > ResourceDisk.
-func resolveDynamicOSDiskProfile(sku *skewer.SKU, trustedLaunch bool) (OSDiskProfile, bool) {
-	if sku == nil || !sku.IsEphemeralOSDiskSupported() {
-		return OSDiskProfile{}, false
-	}
-
-	nvmeMiB, _ := sku.GetCapabilityIntegerQuantity("NvmeDiskSizeInMiB")
-	cacheBytes, _ := sku.MaxCachedDiskBytes()
-	resourceMiB, _ := sku.MaxResourceVolumeMB() // NOTE: MaxResourceVolumeMB is actually in MiBs
-
-	// Round decimal-GB capacities to GiB, matching the sizing used before the v1.14 sync.
-	roundToGiB := func(bytes int64) int64 {
-		return int64(math.Round(float64(bytes/int64(units.Gigabyte)) / (float64(units.GiB) / float64(units.Gigabyte))))
-	}
-
-	var sizeGiB int64
-	var placement armcompute.DiffDiskPlacement
-	switch {
-	case nvmeMiB > 0 && sku.HasCapabilityWithSeparator("SupportedEphemeralOSDiskPlacements", string(armcompute.DiffDiskPlacementNvmeDisk)):
-		sizeGiB, placement = nvmeMiB*int64(units.MiB)/int64(units.GiB), armcompute.DiffDiskPlacementNvmeDisk
-	case cacheBytes > 0:
-		sizeGiB, placement = roundToGiB(cacheBytes), armcompute.DiffDiskPlacementCacheDisk
-	case resourceMiB > 0:
-		sizeGiB, placement = roundToGiB(resourceMiB*int64(units.MiB)), armcompute.DiffDiskPlacementResourceDisk
-	default:
-		return OSDiskProfile{}, false
-	}
-
-	if trustedLaunch {
-		sizeGiB--
-	}
-	sizeGiB = min(sizeGiB, maxEphemeralOSDiskSizeGiB)
-	if sizeGiB <= 0 {
-		return OSDiskProfile{}, false
-	}
-	return OSDiskProfile{
-		SizeGB:    int32(sizeGiB),
-		Type:      armcontainerservice.OSDiskTypeEphemeral,
-		Placement: lo.ToPtr(placement),
-	}, true
 }
 
 // defaultManagedOSDiskSizeGB returns the managed OS disk size by vCPU count, mirroring AKS defaulting.

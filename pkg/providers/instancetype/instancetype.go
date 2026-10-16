@@ -333,7 +333,7 @@ func CalculateMemoryWithoutOverhead(vmMemoryOverheadPercent float64, skuMemoryGi
 // size is GiB, while the existing decimal-G quantity leaves headroom for filesystem
 // and image overhead before kubelet's separate eviction reservation is applied.
 func ephemeralStorage(sku *skewer.SKU, params *instanceTypeParameters) *resource.Quantity {
-	profile := ResolveOSDiskProfileFromSKU(sku, params.OSDiskSizeGB, params.OSDiskType, params.TrustedLaunch, params.OSDiskSizeDynamic)
+	profile := ResolveOSDiskProfileFromSKU(sku, params.OSDiskSizeGB, params.OSDiskType, params.TrustedLaunch)
 	return resources.Quantity(fmt.Sprintf("%dG", profile.SizeGB))
 }
 

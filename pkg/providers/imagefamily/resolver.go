@@ -179,7 +179,6 @@ func (r *defaultResolver) Resolve(
 		nodeClass.Spec.OSDiskSizeGB,
 		lo.FromPtr(nodeClass.Spec.OSDiskType),
 		nodeClass.IsTrustedLaunchEnabled(),
-		nodeClass.Spec.OSDiskSizeDynamic,
 	)
 	if err != nil {
 		return nil, err
